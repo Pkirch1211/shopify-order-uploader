@@ -9,8 +9,6 @@ from datetime import datetime, UTC
 from urllib.parse import urlparse, parse_qs
 
 # -------------------- Config --------------------
-SHOPIFY_TOKEN = os.getenv("SHOPIFY_TOKEN", "")
-SHOPIFY_STORE = os.getenv("SHOPIFY_STORE", "")
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-10")
 SHOP_CURRENCY = os.getenv("SHOP_CURRENCY", "USD")
 HTTP_TIMEOUT = 25
@@ -21,30 +19,51 @@ MAX_PAGES_PER_STATUS = 100
 REST_PAGE_SLEEP = 0.03
 REST_DEDUPE_ENABLED = True
 
-SHOPIFY_BASE = ""
-shopify_rest_headers = {}
+
+def _get_shopify_token():
+    return os.getenv("SHOPIFY_TOKEN", "")
+
+
+def _get_shopify_store():
+    return os.getenv("SHOPIFY_STORE", "")
+
+
+def _get_shopify_base():
+    store = _get_shopify_store()
+    if not store:
+        raise ValueError("Missing SHOPIFY_STORE in environment")
+    return (
+        f"https://{store.strip('/')}"
+        if not store.startswith("http")
+        else store.rstrip("/")
+    )
+
+
+def get_rest_headers():
+    token = _get_shopify_token()
+    if not token:
+        raise ValueError("Missing SHOPIFY_TOKEN in environment")
+    return {
+        "X-Shopify-Access-Token": token,
+        "Content-Type": "application/json",
+    }
+
 
 def init_shopify():
-    global SHOPIFY_BASE, shopify_rest_headers, SHOPIFY_TOKEN, SHOPIFY_STORE
-    SHOPIFY_TOKEN = os.getenv("SHOPIFY_TOKEN", "")
-    SHOPIFY_STORE = os.getenv("SHOPIFY_STORE", "")
-    if not SHOPIFY_TOKEN or not SHOPIFY_STORE:
+    """Validate that env vars are present. No longer sets globals."""
+    token = _get_shopify_token()
+    store = _get_shopify_store()
+    if not token or not store:
         raise ValueError("Missing SHOPIFY_TOKEN or SHOPIFY_STORE in environment")
-    SHOPIFY_BASE = (
-        f"https://{SHOPIFY_STORE.strip('/')}"
-        if not SHOPIFY_STORE.startswith("http")
-        else SHOPIFY_STORE.rstrip("/")
-    )
-    shopify_rest_headers = {
-        "X-Shopify-Access-Token": SHOPIFY_TOKEN,
-        "Content-Type": "application/json"
-    }
+
 
 # -------------------- Utilities --------------------
 _norm_hash_space = re.compile(r"[#\s]")
 
+
 def norm_po(po):
     return _norm_hash_space.sub("", str(po or "").strip()).upper()
+
 
 def parse_price(val):
     if val is None:
@@ -62,8 +81,10 @@ def parse_price(val):
     except (InvalidOperation, ValueError):
         return None
 
+
 def to_gid(kind, numeric_id):
     return f"gid://shopify/{kind}/{numeric_id}"
+
 
 def _to_yyyy_mm_dd(val):
     if not val:
@@ -86,16 +107,20 @@ def _to_yyyy_mm_dd(val):
             pass
     return s[:10]
 
+
 def shopify_graphql(query, variables=None):
-    url = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    base = _get_shopify_base()
+    token = _get_shopify_token()
+    url = f"{base}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
     r = requests.post(
         url,
-        headers={"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json"},
+        headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
         json={"query": query, "variables": variables or {}},
         timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     return r.json()
+
 
 # -------------------- Assortment Map --------------------
 ASSORTMENT_MAP = {
@@ -146,16 +171,20 @@ ASSORTMENT_MAP = {
     ],
 }
 
+
 def is_assortment_parent(sku):
     return (sku or "") in ASSORTMENT_MAP
+
 
 def expand_assortment_children(parent_sku, parent_qty):
     base = ASSORTMENT_MAP.get(parent_sku, [])
     q = int(parent_qty or 0)
     return [(child, per * q, fallback) for (child, per, fallback) in base]
 
+
 # -------------------- Catalog --------------------
 _variant_cache = {}
+
 
 def find_variant_id_and_price(sku):
     if not sku:
@@ -181,22 +210,28 @@ def find_variant_id_and_price(sku):
         pass
     return None, None
 
+
 def clear_variant_cache():
     _variant_cache.clear()
 
+
 # -------------------- Country/State --------------------
 US_STATE_ABBR = {
-    "alabama":"AL","alaska":"AK","arizona":"AZ","arkansas":"AR","california":"CA","colorado":"CO",
-    "connecticut":"CT","delaware":"DE","district of columbia":"DC","florida":"FL","georgia":"GA",
-    "hawaii":"HI","idaho":"ID","illinois":"IL","indiana":"IN","iowa":"IA","kansas":"KS",
-    "kentucky":"KY","louisiana":"LA","maine":"ME","maryland":"MD","massachusetts":"MA",
-    "michigan":"MI","minnesota":"MN","mississippi":"MS","missouri":"MO","montana":"MT",
-    "nebraska":"NE","nevada":"NV","new hampshire":"NH","new jersey":"NJ","new mexico":"NM",
-    "new york":"NY","north carolina":"NC","north dakota":"ND","ohio":"OH","oklahoma":"OK",
-    "oregon":"OR","pennsylvania":"PA","rhode island":"RI","south carolina":"SC",
-    "south dakota":"SD","tennessee":"TN","texas":"TX","utah":"UT","vermont":"VT",
-    "virginia":"VA","washington":"WA","west virginia":"WV","wisconsin":"WI","wyoming":"WY",
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "district of columbia": "DC", "florida": "FL", "georgia": "GA", "hawaii": "HI",
+    "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY",
 }
+
 
 def normalize_country(v):
     if not v:
@@ -208,6 +243,7 @@ def normalize_country(v):
         return "US"
     return v
 
+
 def normalize_zone(country_code, state):
     if not state:
         return None
@@ -218,6 +254,7 @@ def normalize_zone(country_code, state):
     if cc == "US":
         return US_STATE_ABBR.get(s.lower()) or s
     return s
+
 
 def _fix_countries(order):
     original_ship = order.get("shipToCountry")
@@ -233,10 +270,12 @@ def _fix_countries(order):
             if len(bt) == 2 and bt != bt.upper():
                 order["billToCountry"] = bt.upper()
 
+
 # -------------------- B2B --------------------
 _company_id_cache = {}
 _location_id_cache = {}
 _role_id_cache = {}
+
 
 def find_company_by_name(name):
     if not name:
@@ -255,6 +294,7 @@ def find_company_by_name(name):
                 return cid
     return None
 
+
 def create_company(name):
     m = """mutation($input: CompanyCreateInput!) { companyCreate(input: $input) { company { id name } userErrors { field message } } }"""
     data = shopify_graphql(m, {"input": {"company": {"name": name}}})
@@ -262,6 +302,7 @@ def create_company(name):
     if errs:
         raise RuntimeError(f"companyCreate error: {errs}")
     return (data.get("data", {}) or {}).get("companyCreate", {}).get("company", {}).get("id")
+
 
 def ensure_company(name):
     if not name:
@@ -273,6 +314,7 @@ def ensure_company(name):
     if cid:
         _company_id_cache[name] = cid
     return cid
+
 
 def to_company_address_input(order, kind):
     if kind == "billing":
@@ -296,6 +338,7 @@ def to_company_address_input(order, kind):
             "phone": order.get("shipToPhone"),
             "recipient": f"{order.get('buyerFirstName') or ''} {order.get('buyerLastName') or ''}".strip() or None,
         }
+
 
 def ensure_company_location(company_id, name, order):
     key = (company_id, name or "Default")
@@ -327,9 +370,9 @@ def ensure_company_location(company_id, name, order):
                     companyLocationAssignAddress(locationId: $locationId, address: $address, addressTypes: $types) {
                       userErrors { field message } } }"""
                 if not ship_has:
-                    shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order,"shipping"), "types": ["SHIPPING"]})
+                    shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order, "shipping"), "types": ["SHIPPING"]})
                 if not bill_has and order.get("billToAddress1"):
-                    shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order,"billing"), "types": ["BILLING"]})
+                    shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order, "billing"), "types": ["BILLING"]})
             except Exception:
                 pass
             return lid
@@ -346,9 +389,9 @@ def ensure_company_location(company_id, name, order):
                 m = """mutation($locationId: ID!, $address: CompanyAddressInput!, $types: [CompanyAddressType!]!) {
                     companyLocationAssignAddress(locationId: $locationId, address: $address, addressTypes: $types) {
                       userErrors { field message } } }"""
-                shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order,"shipping"), "types": ["SHIPPING"]})
+                shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order, "shipping"), "types": ["SHIPPING"]})
                 if order.get("billToAddress1"):
-                    shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order,"billing"), "types": ["BILLING"]})
+                    shopify_graphql(m, {"locationId": lid, "address": to_company_address_input(order, "billing"), "types": ["BILLING"]})
             except Exception:
                 pass
             try:
@@ -380,6 +423,7 @@ def ensure_company_location(company_id, name, order):
         _location_id_cache[key] = lid
     return lid
 
+
 def iterate_company_contacts(company_id):
     q = """
     query($id: ID!, $after: String) {
@@ -401,6 +445,7 @@ def iterate_company_contacts(company_id):
             after = pi.get("endCursor")
         else:
             break
+
 
 def get_or_create_matching_contact(company_id, customer_id_numeric):
     target_gid = to_gid("Customer", customer_id_numeric)
@@ -425,6 +470,7 @@ def get_or_create_matching_contact(company_id, customer_id_numeric):
                 return cid
     return None
 
+
 def get_company_role_id(company_id, role_name="Ordering only"):
     key = (company_id, role_name)
     if key in _role_id_cache:
@@ -437,6 +483,7 @@ def get_company_role_id(company_id, role_name="Ordering only"):
             _role_id_cache[key] = n.get("id")
             return n.get("id")
     return None
+
 
 def grant_ordering_permission(company_contact_id, company_location_id, company_id):
     role_id = get_company_role_id(company_id, "Ordering only")
@@ -461,6 +508,7 @@ def grant_ordering_permission(company_contact_id, company_location_id, company_i
     if errs and not any("already" in (e.get("message", "").lower()) for e in errs):
         pass  # non-blocking
 
+
 # -------------------- Excel Loader --------------------
 def _normalize_sku(val):
     if val is None or (isinstance(val, float) and math.isnan(val)):
@@ -469,6 +517,7 @@ def _normalize_sku(val):
     if re.fullmatch(r"\d+\.0", s):
         return s[:-2]
     return s
+
 
 ALIASES = {
     "poNumber": ["poNumber"],
@@ -504,11 +553,13 @@ ALIASES = {
 
 REQUIRED_COLUMNS = ["poNumber", "Item #", "Quantity"]
 
+
 def _alias_get(row, aliases, default=None):
     for a in aliases:
         if a and a in row and pd.notna(row[a]) and str(row[a]).strip() != "":
             return row[a]
     return default
+
 
 def validate_excel(path):
     """Returns (is_valid, errors, warnings, column_list)"""
@@ -545,6 +596,7 @@ def validate_excel(path):
             errors.append("No rows with valid PO numbers found")
 
     return len(errors) == 0, errors, warnings, cols
+
 
 def load_orders_from_excel(path, sheet_name="Flat File"):
     df = pd.read_excel(str(path), sheet_name=sheet_name, dtype=str)
@@ -610,6 +662,7 @@ def load_orders_from_excel(path, sheet_name="Flat File"):
     orders = [o for o in grouped.values() if o.get("details")]
     return orders
 
+
 # -------------------- Address helpers --------------------
 def to_mailing_address(order, kind):
     if kind == "billing":
@@ -639,18 +692,22 @@ def to_mailing_address(order, kind):
             "phone": order.get("shipToPhone"),
         }
 
+
 # -------------------- Customer helpers --------------------
 def _lc(s):
     return (s or "").strip().lower()
 
+
 def find_customer_by_email(email):
-    url = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/customers/search.json"
-    r = requests.get(url, headers=shopify_rest_headers, params={"query": f"email:{email}"}, timeout=HTTP_TIMEOUT)
+    base = _get_shopify_base()
+    url = f"{base}/admin/api/{SHOPIFY_API_VERSION}/customers/search.json"
+    r = requests.get(url, headers=get_rest_headers(), params={"query": f"email:{email}"}, timeout=HTTP_TIMEOUT)
     if r.ok:
         for c in r.json().get("customers", []):
             if _lc(c.get("email")) == _lc(email):
                 return c
     return None
+
 
 def find_customer_by_name_company(first, last, company):
     terms = []
@@ -663,13 +720,15 @@ def find_customer_by_name_company(first, last, company):
     if not terms:
         return None
     q = " ".join(terms)
-    url = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/customers/search.json"
-    r = requests.get(url, headers=shopify_rest_headers, params={"query": q}, timeout=HTTP_TIMEOUT)
+    base = _get_shopify_base()
+    url = f"{base}/admin/api/{SHOPIFY_API_VERSION}/customers/search.json"
+    r = requests.get(url, headers=get_rest_headers(), params={"query": q}, timeout=HTTP_TIMEOUT)
     if r.ok:
         for c in r.json().get("customers", []):
             if _lc(c.get("first_name")) == _lc(first) and _lc(c.get("last_name")) == _lc(last) and _lc(c.get("company")) == _lc(company):
                 return c
     return None
+
 
 def create_or_find_customer(order, po_number):
     buyer_email = order.get("shipToEmail") or order.get("billToEmail") or None
@@ -713,8 +772,9 @@ def create_or_find_customer(order, po_number):
     if addresses:
         customer_body["addresses"] = addresses
 
-    create_url = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/customers.json"
-    cr = requests.post(create_url, headers=shopify_rest_headers, json={"customer": customer_body}, timeout=HTTP_TIMEOUT)
+    base = _get_shopify_base()
+    create_url = f"{base}/admin/api/{SHOPIFY_API_VERSION}/customers.json"
+    cr = requests.post(create_url, headers=get_rest_headers(), json={"customer": customer_body}, timeout=HTTP_TIMEOUT)
 
     if cr.status_code == 422:
         err_json = cr.json() if cr.content else {"raw": cr.text}
@@ -725,13 +785,14 @@ def create_or_find_customer(order, po_number):
             retry_body.pop("email", None)
         if "phone" in reason:
             retry_body.pop("phone", None)
-        cr = requests.post(create_url, headers=shopify_rest_headers, json={"customer": retry_body}, timeout=HTTP_TIMEOUT)
+        cr = requests.post(create_url, headers=get_rest_headers(), json={"customer": retry_body}, timeout=HTTP_TIMEOUT)
 
     if cr.status_code == 422:
         raise RuntimeError(f"Cannot create customer for PO {po_number}: {cr.json()}")
 
     cr.raise_for_status()
     return cr.json()["customer"]["id"], True
+
 
 # -------------------- De-dupe --------------------
 def _draft_exists_graphql(po):
@@ -748,17 +809,19 @@ def _draft_exists_graphql(po):
         pass
     return False
 
+
 def _rest_draft_exists(target_po_norm):
-    base = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json"
+    base = _get_shopify_base()
+    url = f"{base}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json"
     fields = "id,po_number,tags,created_at"
     for status in ("open", "invoice_sent"):
         params = {"status": status, "limit": REST_PAGE_LIMIT, "fields": fields}
-        url = base
+        current_url = url
         pages = 0
         while True:
             pages += 1
             try:
-                r = requests.get(url, headers=shopify_rest_headers, params=params, timeout=HTTP_TIMEOUT)
+                r = requests.get(current_url, headers=get_rest_headers(), params=params, timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
             except Exception:
                 break
@@ -770,9 +833,9 @@ def _rest_draft_exists(target_po_norm):
                 break
             try:
                 next_part = [p for p in link.split(",") if 'rel="next"' in p][0]
-                next_url = next_part[next_part.find("<")+1:next_part.find(">")]
+                next_url = next_part[next_part.find("<") + 1:next_part.find(">")]
                 pu = urlparse(next_url)
-                url = f"{pu.scheme}://{pu.netloc}{pu.path}"
+                current_url = f"{pu.scheme}://{pu.netloc}{pu.path}"
                 q = parse_qs(pu.query)
                 params = {"status": status, "limit": REST_PAGE_LIMIT, "page_info": q.get("page_info", [""])[0]}
             except Exception:
@@ -781,6 +844,7 @@ def _rest_draft_exists(target_po_norm):
                 break
             time.sleep(REST_PAGE_SLEEP)
     return False
+
 
 def draft_po_exists_in_shopify(po):
     target = norm_po(po)
@@ -800,16 +864,18 @@ def draft_po_exists_in_shopify(po):
         return _rest_draft_exists(target)
     return False
 
+
 def _rest_order_exists(target_po_norm):
-    base = f"{SHOPIFY_BASE}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
+    base = _get_shopify_base()
+    url = f"{base}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
     fields = "id,po_number,cancelled_at,created_at"
     params = {"status": "any", "limit": REST_PAGE_LIMIT, "fields": fields}
-    url = base
+    current_url = url
     pages = 0
     while True:
         pages += 1
         try:
-            r = requests.get(url, headers=shopify_rest_headers, params=params, timeout=HTTP_TIMEOUT)
+            r = requests.get(current_url, headers=get_rest_headers(), params=params, timeout=HTTP_TIMEOUT)
             r.raise_for_status()
             data = r.json() or {}
         except Exception:
@@ -824,12 +890,13 @@ def _rest_order_exists(target_po_norm):
         m = re.search(r'<([^>]+)>;\s*rel="next"', link)
         if not m:
             break
-        url = m.group(1)
+        current_url = m.group(1)
         params = {}
         if pages >= MAX_PAGES_PER_STATUS:
             break
         time.sleep(REST_PAGE_SLEEP)
     return False
+
 
 def order_po_exists_in_shopify(po):
     target = norm_po(po)
