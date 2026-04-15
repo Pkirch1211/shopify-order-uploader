@@ -522,25 +522,28 @@ document.getElementById('btn-to-mode').addEventListener('click', () => { setStep
 document.getElementById('btn-back-upload').addEventListener('click', resetAll);
 document.getElementById('btn-back-review').addEventListener('click', () => { setStep(2); showPhase('review'); });
 
-document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener('change', () => {
-  const val = document.querySelector('input[name=mode]:checked')?.value;
+function selectMode(val) {
   document.getElementById('mode-draft-card').classList.remove('selected-draft');
   document.getElementById('mode-order-card').classList.remove('selected-order');
   document.getElementById('mode-warning').classList.add('hidden');
   const bs = document.getElementById('btn-submit');
-  if (val==='draft') {
+  if (val === 'draft') {
+    document.querySelector('input[name=mode][value=draft]').checked = true;
     document.getElementById('mode-draft-card').classList.add('selected-draft');
     document.getElementById('confirm-title').textContent = `Create ${totalOrders} Draft Order${totalOrders!==1?'s':''}`;
     document.getElementById('confirm-sub').textContent   = 'Orders will be created as editable drafts';
     bs.textContent = 'Create Drafts'; bs.className = 'btn btn-amber'; bs.disabled = false;
-  } else if (val==='order') {
+  } else if (val === 'order') {
+    document.querySelector('input[name=mode][value=order]').checked = true;
     document.getElementById('mode-order-card').classList.add('selected-order');
     document.getElementById('mode-warning').classList.remove('hidden');
     document.getElementById('confirm-title').textContent = `Create ${totalOrders} Live Order${totalOrders!==1?'s':''}`;
     document.getElementById('confirm-sub').textContent   = 'Orders created immediately · Status: PENDING';
     bs.textContent = 'Submit Live Orders'; bs.className = 'btn btn-primary'; bs.disabled = false;
   }
-}));
+}
+document.getElementById('mode-draft-card').addEventListener('click', () => selectMode('draft'));
+document.getElementById('mode-order-card').addEventListener('click', () => selectMode('order'));
 
 document.getElementById('btn-submit').addEventListener('click', async () => {
   const mode = document.querySelector('input[name=mode]:checked')?.value;
