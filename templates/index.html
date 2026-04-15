@@ -542,8 +542,8 @@ function selectMode(val) {
     bs.textContent = 'Submit Live Orders'; bs.className = 'btn btn-primary'; bs.disabled = false;
   }
 }
-document.getElementById('mode-draft-card').addEventListener('click', () => selectMode('draft'));
-document.getElementById('mode-order-card').addEventListener('click', () => selectMode('order'));
+document.getElementById('mode-draft-card').addEventListener('click', (e) => { e.preventDefault(); selectMode('draft'); });
+document.getElementById('mode-order-card').addEventListener('click', (e) => { e.preventDefault(); selectMode('order'); });
 
 document.getElementById('btn-submit').addEventListener('click', async () => {
   const mode = document.querySelector('input[name=mode]:checked')?.value;
