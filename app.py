@@ -22,15 +22,57 @@ app.secret_key = os.getenv("FLASK_SECRET", os.urandom(24).hex())
 
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 EXPORT_FOLDER = BASE_DIR / "exports"
+JOBS_FOLDER   = BASE_DIR / "jobs"
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 EXPORT_FOLDER.mkdir(exist_ok=True)
+JOBS_FOLDER.mkdir(exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xls"}
 MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-# In-memory job store (fine for 4 users, single-process)
-jobs = {}
+# Thread lock for job file writes
+_job_locks = {}
+_job_locks_lock = threading.Lock()
+
+def _get_job_lock(job_id):
+    with _job_locks_lock:
+        if job_id not in _job_locks:
+            _job_locks[job_id] = threading.Lock()
+        return _job_locks[job_id]
+
+def _job_path(job_id):
+    return JOBS_FOLDER / f"{job_id}.json"
+
+def _load_job(job_id):
+    p = _job_path(job_id)
+    if not p.exists():
+        return None
+    with _get_job_lock(job_id):
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+def _save_job(job_id, job):
+    with _get_job_lock(job_id):
+        with open(_job_path(job_id), "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
+
+def _update_job(job_id, **kwargs):
+    job = _load_job(job_id) or {}
+    job.update(kwargs)
+    _save_job(job_id, job)
+    return job
+
+def _append_log(job_id, entry):
+    with _get_job_lock(job_id):
+        p = _job_path(job_id)
+        job = {}
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                job = json.load(f)
+        job.setdefault("log", []).append(entry)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
 
 
 def allowed_file(filename):
@@ -48,7 +90,6 @@ def index():
 
 @app.route("/api/validate", methods=["POST"])
 def api_validate():
-    """Upload file and validate it. Returns preview data."""
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "No file uploaded"}), 400
 
@@ -72,20 +113,18 @@ def api_validate():
         save_path.unlink(missing_ok=True)
         return jsonify({"ok": False, "errors": errors, "warnings": warnings}), 422
 
-    # Load orders for preview
     try:
         orders = load_orders_from_excel(str(save_path))
     except Exception as e:
         save_path.unlink(missing_ok=True)
         return jsonify({"ok": False, "error": f"Failed to parse file: {e}"}), 422
 
-    # Build preview summary
     total_lines = sum(len(o.get("details", [])) for o in orders)
     companies = list({o.get("billToName") or "Unknown" for o in orders})
     po_list = [o.get("poNumber") for o in orders]
 
     preview_rows = []
-    for o in orders[:50]:  # cap preview at 50
+    for o in orders[:50]:
         preview_rows.append({
             "po": o.get("poNumber"),
             "company": o.get("billToName") or "—",
@@ -94,13 +133,16 @@ def api_validate():
             "ship_date": o.get("shipDate") or "—",
         })
 
-    jobs[job_id] = {
+    # Persist job to disk
+    job = {
         "file_path": str(save_path),
         "status": "ready",
         "orders": orders,
         "results": [],
         "log": [],
+        "csv_path": None,
     }
+    _save_job(job_id, job)
 
     return jsonify({
         "ok": True,
@@ -117,13 +159,15 @@ def api_validate():
 
 
 def _run_job(job_id, mode):
-    job = jobs[job_id]
+    job = _load_job(job_id)
     orders = job["orders"]
-    job["status"] = "running"
-    job["log"] = []
+    _update_job(job_id, status="running", log=[])
 
     def progress(po, status, msg):
-        job["log"].append({"po": po, "status": status, "msg": msg, "ts": datetime.now(UTC).isoformat()})
+        _append_log(job_id, {
+            "po": po, "status": status, "msg": msg,
+            "ts": datetime.now(UTC).isoformat()
+        })
 
     try:
         clear_variant_cache()
@@ -132,10 +176,6 @@ def _run_job(job_id, mode):
         else:
             results = process_live_orders(orders, progress_callback=progress)
 
-        job["results"] = results
-        job["status"] = "done"
-
-        # Write export CSV
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode_label = "draft" if mode == "draft" else "order"
         csv_path = EXPORT_FOLDER / f"shopify_{mode_label}_export_{ts}_{job_id}.csv"
@@ -144,26 +184,28 @@ def _run_job(job_id, mode):
             w = csv.DictWriter(cf, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
             w.writerows(results)
-        job["csv_path"] = str(csv_path)
+
+        _update_job(job_id, status="done", results=results, csv_path=str(csv_path))
 
     except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-        job["log"].append({"po": "—", "status": "error", "msg": str(e), "ts": datetime.now(UTC).isoformat()})
+        _append_log(job_id, {
+            "po": "—", "status": "error", "msg": str(e),
+            "ts": datetime.now(UTC).isoformat()
+        })
+        _update_job(job_id, status="error", error=str(e))
 
 
 @app.route("/api/submit", methods=["POST"])
 def api_submit():
     data = request.get_json()
     job_id = data.get("job_id")
-    mode = data.get("mode")  # "draft" or "order"
+    mode = data.get("mode")
 
-    if job_id not in jobs:
+    job = _load_job(job_id)
+    if job is None:
         return jsonify({"ok": False, "error": "Unknown job"}), 404
     if mode not in ("draft", "order"):
         return jsonify({"ok": False, "error": "mode must be 'draft' or 'order'"}), 400
-
-    job = jobs[job_id]
     if job["status"] not in ("ready",):
         return jsonify({"ok": False, "error": f"Job is already {job['status']}"}), 409
 
@@ -180,26 +222,26 @@ def api_submit():
 
 @app.route("/api/status/<job_id>")
 def api_status(job_id):
-    if job_id not in jobs:
+    job = _load_job(job_id)
+    if job is None:
         return jsonify({"ok": False, "error": "Unknown job"}), 404
 
-    job = jobs[job_id]
-    response = {
+    return jsonify({
         "ok": True,
-        "status": job["status"],
+        "status": job.get("status"),
         "log": job.get("log", []),
         "results": job.get("results", []),
         "error": job.get("error"),
         "has_csv": bool(job.get("csv_path")),
-    }
-    return jsonify(response)
+    })
 
 
 @app.route("/api/download/<job_id>")
 def api_download(job_id):
-    if job_id not in jobs:
+    job = _load_job(job_id)
+    if job is None:
         return jsonify({"ok": False, "error": "Unknown job"}), 404
-    csv_path = jobs[job_id].get("csv_path")
+    csv_path = job.get("csv_path")
     if not csv_path or not Path(csv_path).exists():
         return jsonify({"ok": False, "error": "No export available"}), 404
     return send_file(csv_path, as_attachment=True)
