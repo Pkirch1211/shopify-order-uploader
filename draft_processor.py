@@ -165,16 +165,23 @@ def create_draft_order(order, customer_id, company_id, company_contact_id, compa
     raise RuntimeError(f"draftOrderCreate failed. Last errors: {errs}")
 
 
-def process_draft_orders(orders, progress_callback=None):
+def process_draft_orders(orders, progress_callback=None, cancel_event=None):
     """
     Process a list of orders as drafts.
     progress_callback(po_number, status, message) called for each PO.
+    cancel_event: threading.Event — if set, processing stops before the next order.
     Returns list of result dicts.
     """
     results = []
     seen_pos = set()
 
     for i, order in enumerate(orders):
+        # Cancellation check — stops before starting the next order
+        if cancel_event and cancel_event.is_set():
+            if progress_callback:
+                progress_callback("—", "cancelled", "Job cancelled — remaining orders skipped")
+            break
+
         po_number = order.get("poNumber")
         po_norm = norm_po(po_number)
         billToName = order.get("billToName")
