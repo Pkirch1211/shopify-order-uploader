@@ -35,6 +35,18 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 _job_locks = {}
 _job_locks_lock = threading.Lock()
 
+# Cancellation events per job
+_job_cancel_events: dict[str, threading.Event] = {}
+_job_cancel_lock = threading.Lock()
+
+
+def _get_cancel_event(job_id: str) -> threading.Event:
+    with _job_cancel_lock:
+        if job_id not in _job_cancel_events:
+            _job_cancel_events[job_id] = threading.Event()
+        return _job_cancel_events[job_id]
+
+
 def _get_job_lock(job_id):
     with _job_locks_lock:
         if job_id not in _job_locks:
@@ -159,6 +171,9 @@ def api_validate():
 
 
 def _run_job(job_id, mode):
+    cancel_event = _get_cancel_event(job_id)
+    cancel_event.clear()
+
     job = _load_job(job_id)
     orders = job["orders"]
     _update_job(job_id, status="running", log=[])
@@ -172,9 +187,9 @@ def _run_job(job_id, mode):
     try:
         clear_variant_cache()
         if mode == "draft":
-            results = process_draft_orders(orders, progress_callback=progress)
+            results = process_draft_orders(orders=orders, progress_callback=progress, cancel_event=cancel_event)
         else:
-            results = process_live_orders(orders, progress_callback=progress)
+            results = process_live_orders(orders=orders, progress_callback=progress, cancel_event=cancel_event)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode_label = "draft" if mode == "draft" else "order"
@@ -185,7 +200,8 @@ def _run_job(job_id, mode):
             w.writeheader()
             w.writerows(results)
 
-        _update_job(job_id, status="done", results=results, csv_path=str(csv_path))
+        final_status = "cancelled" if cancel_event.is_set() else "done"
+        _update_job(job_id, status=final_status, results=results, csv_path=str(csv_path))
 
     except Exception as e:
         _append_log(job_id, {
@@ -234,6 +250,17 @@ def api_status(job_id):
         "error": job.get("error"),
         "has_csv": bool(job.get("csv_path")),
     })
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def api_cancel(job_id):
+    job = _load_job(job_id)
+    if job is None:
+        return jsonify({"ok": False, "error": "Unknown job"}), 404
+    if job.get("status") != "running":
+        return jsonify({"ok": False, "error": "Job is not running"}), 409
+    _get_cancel_event(job_id).set()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/download/<job_id>")
