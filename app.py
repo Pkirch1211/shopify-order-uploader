@@ -201,7 +201,10 @@ def _run_job(job_id, mode):
             w.writerows(results)
 
         final_status = "cancelled" if cancel_event.is_set() else "done"
-        _update_job(job_id, status=final_status, results=results, csv_path=str(csv_path))
+        # Write results and csv_path before flipping status, so the poller
+        # can never see status=done/cancelled with an empty results list.
+        _update_job(job_id, results=results, csv_path=str(csv_path))
+        _update_job(job_id, status=final_status)
 
     except Exception as e:
         _append_log(job_id, {
