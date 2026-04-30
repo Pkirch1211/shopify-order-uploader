@@ -243,6 +243,7 @@
   .log-skipped    .log-msg { color: var(--text-dim); }
   .log-error      .log-msg { color: var(--red); }
   .log-processing .log-msg { color: var(--amber); }
+  .log-cancelled  .log-msg { color: var(--red); }
   .log-box::-webkit-scrollbar { width: 4px; }
   .log-box::-webkit-scrollbar-thumb { background: var(--border-mid); border-radius: 2px; }
 
@@ -412,6 +413,14 @@
           </div>
         </div>
       </div>
+      <div class="actions" id="cancel-bar">
+        <button class="btn btn-ghost" id="btn-cancel-job" style="color:var(--red);border-color:var(--red-border)">
+          ✕ &nbsp;Cancel Job
+        </button>
+        <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">
+          Orders already created will remain in Shopify
+        </span>
+      </div>
     </div>
   </div>
 
@@ -552,12 +561,38 @@ document.getElementById('btn-submit').addEventListener('click', async () => {
   if (mode==='order' && !confirm(`⚠ Create ${totalOrders} LIVE order(s) in Shopify with status PENDING?\n\nThis cannot be easily undone. Continue?`)) return;
   setStep(4); showPhase('processing');
   document.getElementById('log-box').innerHTML = '';
+  // Reset cancel button state in case this is a re-run path
+  const cancelBtn = document.getElementById('btn-cancel-job');
+  cancelBtn.disabled = false;
+  cancelBtn.innerHTML = '✕ &nbsp;Cancel Job';
+  document.getElementById('cancel-bar').classList.remove('hidden');
   try {
     const res  = await fetch('/api/submit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id:currentJobId, mode})});
     const data = await res.json();
     if (!data.ok) { alert('Error: '+data.error); return; }
     startPolling(currentJobId, totalOrders);
   } catch(e) { alert('Submit error: '+e.message); }
+});
+
+// Cancel job handler
+document.getElementById('btn-cancel-job').addEventListener('click', async () => {
+  if (!currentJobId) return;
+  const btn = document.getElementById('btn-cancel-job');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner" style="border-top-color:var(--red)"></span> &nbsp;Cancelling…';
+  try {
+    const res = await fetch(`/api/cancel/${currentJobId}`, {method: 'POST'});
+    const data = await res.json();
+    if (!data.ok) {
+      // Job may have already finished — not a real error, just restore the button
+      btn.disabled = false;
+      btn.innerHTML = '✕ &nbsp;Cancel Job';
+    }
+    // If ok, polling will detect status=cancelled and call renderResults naturally
+  } catch(e) {
+    btn.disabled = false;
+    btn.innerHTML = '✕ &nbsp;Cancel Job';
+  }
 });
 
 function startPolling(jobId, total) {
@@ -574,7 +609,7 @@ function startPolling(jobId, total) {
         if (['created','skipped','error'].includes(e.status)) processed++;
       });
       if (total>0) document.getElementById('progress-bar').style.width = Math.min(100, Math.round(processed/total*100))+'%';
-      if (data.status==='done' || data.status==='error') {
+      if (data.status==='done' || data.status==='error' || data.status==='cancelled') {
         clearInterval(pollInterval);
         document.getElementById('progress-bar').style.width = '100%';
         renderResults(data); setStep(5); showPhase('done');
@@ -584,12 +619,23 @@ function startPolling(jobId, total) {
 }
 
 function renderResults(data) {
+  // Hide cancel bar now that processing is finished
+  document.getElementById('cancel-bar').classList.add('hidden');
+
   const results = data.results || [];
   const created = results.filter(r=>r.status==='created').length;
   const skipped = results.filter(r=>r.status==='skipped').length;
   const errors  = results.filter(r=>r.status==='error').length;
-  document.getElementById('done-banner').innerHTML =
-    `✓ Processing complete — <strong>${created}</strong> created &nbsp;·&nbsp; <strong>${skipped}</strong> skipped &nbsp;·&nbsp; <strong>${errors}</strong> errors`;
+
+  const doneBanner = document.getElementById('done-banner');
+  if (data.status === 'cancelled') {
+    doneBanner.className = 'alert alert-warn';
+    doneBanner.innerHTML = `⊘ Job cancelled — <strong>${created}</strong> created before stop &nbsp;·&nbsp; <strong>${skipped}</strong> skipped &nbsp;·&nbsp; <strong>${errors}</strong> errors`;
+  } else {
+    doneBanner.className = 'alert alert-success';
+    doneBanner.innerHTML = `✓ Processing complete — <strong>${created}</strong> created &nbsp;·&nbsp; <strong>${skipped}</strong> skipped &nbsp;·&nbsp; <strong>${errors}</strong> errors`;
+  }
+
   document.getElementById('result-chips').innerHTML =
     (created?`<span class="chip chip-green">✓ ${created} Created</span>`:'')+
     (skipped?`<span class="chip chip-amber">⊘ ${skipped} Skipped</span>`:'')+
@@ -627,6 +673,15 @@ function resetAll() {
   bs.disabled=true; bs.textContent='Submit'; bs.className='btn btn-primary';
   document.getElementById('btn-download').style.display='none';
   document.getElementById('progress-bar').style.width='0%';
+  // Reset cancel bar for next run
+  document.getElementById('cancel-bar').classList.remove('hidden');
+  const cancelBtn = document.getElementById('btn-cancel-job');
+  cancelBtn.disabled = false;
+  cancelBtn.innerHTML = '✕ &nbsp;Cancel Job';
+  // Reset done banner to default state
+  const doneBanner = document.getElementById('done-banner');
+  doneBanner.className = 'alert alert-success';
+  doneBanner.innerHTML = '✓ Processing complete';
   setStep(1); showPhase('upload');
 }
 
