@@ -138,15 +138,22 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     raise RuntimeError(f"orderCreate failed. Last errors: {errs}")
 
 
-def process_live_orders(orders, progress_callback=None):
+def process_live_orders(orders, progress_callback=None, cancel_event=None):
     """
     Process a list of orders as live orders (financialStatus=PENDING).
+    cancel_event: threading.Event — if set, processing stops before the next order.
     Returns list of result dicts.
     """
     results = []
     seen_pos = set()
 
     for order in orders:
+        # Cancellation check — stops before starting the next order
+        if cancel_event and cancel_event.is_set():
+            if progress_callback:
+                progress_callback("—", "cancelled", "Job cancelled — remaining orders skipped")
+            break
+
         po_number = order.get("poNumber")
         po_norm = norm_po(po_number)
         billToName = order.get("billToName")
