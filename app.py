@@ -2,10 +2,12 @@ import os
 import csv
 import uuid
 import json
+import secrets
 import threading
 from datetime import datetime, UTC
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, send_file, session
+from functools import wraps
+from flask import Flask, render_template, request, jsonify, send_file, session, redirect, make_response
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
@@ -20,6 +22,58 @@ from order_processor import process_live_orders
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", os.urandom(24).hex())
 
+# ── Password protection ───────────────────────────────────────────────────────
+SITE_PASSWORD = os.getenv("SITE_PASSWORD", "edpd")
+AUTH_COOKIE = "ops_auth"
+_authed_tokens = set()
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>LifeLines Order Uploader — Login</title>
+<style>
+@import url('https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#f0f0eb;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'Satoshi',sans-serif}
+.box{background:#f7f7f3;border:1px solid #d4d4cc;border-radius:4px;padding:40px;width:320px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}
+.brand{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#4a6741;margin-bottom:24px}
+h1{font-size:16px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#2a2a28;margin-bottom:24px}
+input{width:100%;background:#fff;border:1px solid #c8c8c0;color:#2a2a28;font-family:'Satoshi',sans-serif;font-size:14px;padding:10px 12px;border-radius:2px;outline:none;margin-bottom:12px}
+input:focus{border-color:#4a6741}
+button{width:100%;background:#4a6741;color:#fff;border:none;font-family:'Satoshi',sans-serif;font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:10px;border-radius:2px;cursor:pointer}
+button:hover{opacity:.85}
+.err{color:#8a2a2a;font-size:12px;margin-top:8px}
+</style></head>
+<body><div class="box">
+<div class="brand">LifeLines</div>
+<h1>Order Uploader</h1>
+<form method="POST" action="/login">
+<input type="password" name="password" placeholder="Password" autofocus>
+<button type="submit">Enter</button>
+%(error)s
+</form>
+</div></body></html>"""
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        if request.form.get("password") == SITE_PASSWORD:
+            token = secrets.token_hex(32)
+            _authed_tokens.add(token)
+            resp = make_response(redirect("/"))
+            resp.set_cookie(AUTH_COOKIE, token, max_age=60*60*24*30, httponly=True)
+            return resp
+        return LOGIN_HTML % {"error": '<div class="err">Incorrect password</div>'}, 401
+    return LOGIN_HTML % {"error": ""}
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.cookies.get(AUTH_COOKIE)
+        if not token or token not in _authed_tokens:
+            return redirect("/login")
+        return f(*args, **kwargs)
+    return decorated
+
+# ── Config ────────────────────────────────────────────────────────────────────
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 EXPORT_FOLDER = BASE_DIR / "exports"
 JOBS_FOLDER   = BASE_DIR / "jobs"
@@ -96,11 +150,13 @@ def make_job_id():
 
 
 @app.route("/")
+@require_auth
 def index():
     return render_template("index.html")
 
 
 @app.route("/api/validate", methods=["POST"])
+@require_auth
 def api_validate():
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "No file uploaded"}), 400
@@ -145,7 +201,6 @@ def api_validate():
             "ship_date": o.get("shipDate") or "—",
         })
 
-    # Persist job to disk
     job = {
         "file_path": str(save_path),
         "status": "ready",
@@ -201,8 +256,6 @@ def _run_job(job_id, mode):
             w.writerows(results)
 
         final_status = "cancelled" if cancel_event.is_set() else "done"
-        # Write results and csv_path before flipping status, so the poller
-        # can never see status=done/cancelled with an empty results list.
         _update_job(job_id, results=results, csv_path=str(csv_path))
         _update_job(job_id, status=final_status)
 
@@ -215,6 +268,7 @@ def _run_job(job_id, mode):
 
 
 @app.route("/api/submit", methods=["POST"])
+@require_auth
 def api_submit():
     data = request.get_json()
     job_id = data.get("job_id")
@@ -240,6 +294,7 @@ def api_submit():
 
 
 @app.route("/api/status/<job_id>")
+@require_auth
 def api_status(job_id):
     job = _load_job(job_id)
     if job is None:
@@ -256,6 +311,7 @@ def api_status(job_id):
 
 
 @app.route("/api/cancel/<job_id>", methods=["POST"])
+@require_auth
 def api_cancel(job_id):
     job = _load_job(job_id)
     if job is None:
@@ -267,6 +323,7 @@ def api_cancel(job_id):
 
 
 @app.route("/api/download/<job_id>")
+@require_auth
 def api_download(job_id):
     job = _load_job(job_id)
     if job is None:
