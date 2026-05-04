@@ -36,9 +36,9 @@ body{background:#f0f0eb;display:flex;align-items:center;justify-content:center;m
 .box{background:#f7f7f3;border:1px solid #d4d4cc;border-radius:4px;padding:40px;width:320px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}
 .brand{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#4a6741;margin-bottom:24px}
 h1{font-size:16px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#2a2a28;margin-bottom:24px}
-input{width:100%;background:#fff;border:1px solid #c8c8c0;color:#2a2a28;font-family:'Satoshi',sans-serif;font-size:14px;padding:10px 12px;border-radius:2px;outline:none;margin-bottom:12px}
+input{width:100%%;background:#fff;border:1px solid #c8c8c0;color:#2a2a28;font-family:'Satoshi',sans-serif;font-size:14px;padding:10px 12px;border-radius:2px;outline:none;margin-bottom:12px}
 input:focus{border-color:#4a6741}
-button{width:100%;background:#4a6741;color:#fff;border:none;font-family:'Satoshi',sans-serif;font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:10px;border-radius:2px;cursor:pointer}
+button{width:100%%;background:#4a6741;color:#fff;border:none;font-family:'Satoshi',sans-serif;font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:10px;border-radius:2px;cursor:pointer}
 button:hover{opacity:.85}
 .err{color:#8a2a2a;font-size:12px;margin-top:8px}
 </style></head>
