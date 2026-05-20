@@ -25,7 +25,6 @@ app.secret_key = os.getenv("FLASK_SECRET", os.urandom(24).hex())
 # ── Password protection ───────────────────────────────────────────────────────
 SITE_PASSWORD = os.getenv("SITE_PASSWORD", "edpd")
 AUTH_COOKIE = "ops_auth"
-_authed_tokens = set()
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>LifeLines Order Uploader — Login</title>
@@ -56,10 +55,15 @@ button:hover{opacity:.85}
 def login():
     if request.method == "POST":
         if request.form.get("password") == SITE_PASSWORD:
-            token = secrets.token_hex(32)
-            _authed_tokens.add(token)
             resp = make_response(redirect("/"))
-            resp.set_cookie(AUTH_COOKIE, token, max_age=60*60*24*30, httponly=True)
+            resp.set_cookie(
+                AUTH_COOKIE,
+                "authenticated",
+                max_age=60*60*24*30,
+                httponly=True,
+                samesite="Lax",
+                secure=True,
+            )
             return resp
         return LOGIN_HTML % {"error": '<div class="err">Incorrect password</div>'}, 401
     return LOGIN_HTML % {"error": ""}
@@ -67,8 +71,7 @@ def login():
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = request.cookies.get(AUTH_COOKIE)
-        if not token or token not in _authed_tokens:
+        if request.cookies.get(AUTH_COOKIE) != "authenticated":
             return redirect("/login")
         return f(*args, **kwargs)
     return decorated
