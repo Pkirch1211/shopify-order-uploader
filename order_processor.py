@@ -16,6 +16,9 @@ from shopify_core import (
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
+print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_UPDATE_V2_FREE_FREIGHT_ZERO_SHIP_LOADED ======")
+print(f"====== DRY_RUN={DRY_RUN} ======")
+
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
 DEFAULT_FREIGHT_TITLE = os.getenv("DEFAULT_FREIGHT_TITLE", "UPS Ground").strip() or "UPS Ground"
 
@@ -219,11 +222,34 @@ def _normalize_terms_text(text: str) -> str:
 
 def _detect_net_terms_days(text: str) -> Optional[int]:
     if not text:
+        print("====== TERMS DETECTION DEBUG ======")
+        print("No text supplied for terms detection")
+        print("===================================")
         return None
 
+    haystack = text.upper()
     normalized = _normalize_terms_text(text)
 
-    checks = [
+    print("====== TERMS DETECTION DEBUG ======")
+    print(f"Raw text: {text}")
+    print(f"Normalized text: {normalized}")
+
+    regex_checks = [
+        (120, [r"\bNET[\s\-_\/:]*120\b", r"\bN[\s\-_\/:]*120\b"]),
+        (90, [r"\bNET[\s\-_\/:]*90\b", r"\bN[\s\-_\/:]*90\b"]),
+        (60, [r"\bNET[\s\-_\/:]*60\b", r"\bN[\s\-_\/:]*60\b"]),
+        (45, [r"\bNET[\s\-_\/:]*45\b", r"\bN[\s\-_\/:]*45\b"]),
+        (30, [r"\bNET[\s\-_\/:]*30\b", r"\bN[\s\-_\/:]*30\b"]),
+    ]
+
+    for days, patterns in regex_checks:
+        for pattern in patterns:
+            if re.search(pattern, haystack, flags=re.IGNORECASE):
+                print(f"Detected Net {days} by regex: {pattern}")
+                print("===================================")
+                return days
+
+    token_checks = [
         (120, ["NET120", "N120"]),
         (90, ["NET90", "N90"]),
         (60, ["NET60", "N60"]),
@@ -231,25 +257,15 @@ def _detect_net_terms_days(text: str) -> Optional[int]:
         (30, ["NET30", "N30"]),
     ]
 
-    for days, tokens in checks:
+    for days, tokens in token_checks:
         for token in tokens:
             if token in normalized:
+                print(f"Detected Net {days} by normalized token: {token}")
+                print("===================================")
                 return days
 
-    haystack = text.upper()
-    patterns = {
-        120: [r"\bNET[\s\-_\/:]*120\b", r"\bN[\s\-_\/:]*120\b"],
-        90: [r"\bNET[\s\-_\/:]*90\b", r"\bN[\s\-_\/:]*90\b"],
-        60: [r"\bNET[\s\-_\/:]*60\b", r"\bN[\s\-_\/:]*60\b"],
-        45: [r"\bNET[\s\-_\/:]*45\b", r"\bN[\s\-_\/:]*45\b"],
-        30: [r"\bNET[\s\-_\/:]*30\b", r"\bN[\s\-_\/:]*30\b"],
-    }
-
-    for days, regexes in patterns.items():
-        for pattern in regexes:
-            if re.search(pattern, haystack, flags=re.IGNORECASE):
-                return days
-
+    print("No Net terms detected")
+    print("===================================")
     return None
 
 
@@ -349,7 +365,13 @@ def _build_freight_quote_from_draft(draft: dict) -> Tuple[bool, str, str, str]:
     blob = _build_draft_style_note_blob(draft)
 
     if _valid_free_freight_marker_present(blob):
-        return True, "free-freight", "", ""
+        freight_title = _detect_freight_title(blob)
+        freight_price = "0.00"
+        print("====== FREE FREIGHT DETECTED ======")
+        print(f"Carrier title for free freight: {freight_title}")
+        print(f"Free freight price: {freight_price}")
+        print("===================================")
+        return True, "free-freight", freight_title, freight_price
 
     subtotal = _draft_subtotal_amount(draft)
     if subtotal is None:
@@ -550,6 +572,11 @@ def _safe_attach_payment_terms_to_order(order_id: str, order: dict, subtotal: Op
 
 
 def _draft_order_update(draft_id: str, input_payload: dict) -> dict:
+    print("====== DRAFT ORDER UPDATE REQUEST ======")
+    print(f"Draft ID: {draft_id}")
+    print(f"Input: {input_payload}")
+    print("========================================")
+
     out = shopify_graphql(
         DRAFT_UPDATE_MUTATION,
         {
@@ -557,6 +584,10 @@ def _draft_order_update(draft_id: str, input_payload: dict) -> dict:
             "input": input_payload,
         },
     )
+
+    print("====== DRAFT ORDER UPDATE RAW RESPONSE ======")
+    print(out)
+    print("=============================================")
 
     payload = _data(out).get("draftOrderUpdate", {}) or {}
     errs = payload.get("userErrors", []) or []
@@ -609,11 +640,13 @@ def _ensure_draft_shipping_logic(draft: dict) -> Tuple[bool, str, str, str, str]
     if not ok:
         return False, freight_action, freight_title, freight_price, freight_action
 
-    if freight_action == "free-freight":
-        return True, freight_action, freight_title, freight_price, "Valid free-freight marker found; leaving shipping unchanged"
+    if not freight_title:
+        freight_title = DEFAULT_FREIGHT_TITLE
 
     if _shipping_line_matches(draft, freight_title, freight_price):
-        return True, freight_action, freight_title, freight_price, f"Existing shipping already matches {freight_title} at {freight_price}"
+        return True, freight_action, freight_title, freight_price, (
+            f"Existing shipping already matches {freight_title} at {freight_price}"
+        )
 
     currency_code = (draft.get("currencyCode") or "").strip() or _shop_currency() or "USD"
     shipping_payload = {
@@ -626,10 +659,21 @@ def _ensure_draft_shipping_logic(draft: dict) -> Tuple[bool, str, str, str, str]
         }
     }
 
-    print(f"Draft {draft.get('name')} | setting custom shipping to {freight_title} at {freight_price} {currency_code}")
+    print(
+        f"Draft {draft.get('name')} | setting custom shipping to "
+        f"{freight_title} at {freight_price} {currency_code} "
+        f"because freight_action={freight_action}"
+    )
     _draft_order_update(draft["id"], shipping_payload)
 
-    return True, freight_action, freight_title, freight_price, f"Set shipping to {freight_title} at {freight_price} {currency_code}"
+    if freight_action == "free-freight":
+        return True, freight_action, freight_title, freight_price, (
+            f"Set free freight shipping to {freight_title} at {freight_price} {currency_code}"
+        )
+
+    return True, freight_action, freight_title, freight_price, (
+        f"Set shipping to {freight_title} at {freight_price} {currency_code}"
+    )
 
 
 def _ensure_draft_payment_terms(draft: dict, now_dt: datetime) -> Tuple[bool, str, str, Optional[int]]:
@@ -716,7 +760,7 @@ def _post_create_update_draft_freight_and_terms(draft_id: str) -> Tuple[dict, st
     current_freight_title = ((latest.get("shippingLine") or {}).get("title") or "").strip()
     current_freight_price = _current_shipping_price(latest)
 
-    if freight_action == "charge-freight" and not _shipping_line_matches(latest, freight_title, freight_price):
+    if freight_action in ("charge-freight", "free-freight") and not _shipping_line_matches(latest, freight_title, freight_price):
         raise RuntimeError(
             f"Expected shipping '{freight_title}' at {freight_price} but Shopify returned "
             f"'{current_freight_title or 'NONE'}' at {current_freight_price or 'NONE'}"
