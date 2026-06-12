@@ -4,6 +4,7 @@ import uuid
 import json
 import secrets
 import threading
+import traceback
 from datetime import datetime, UTC
 from pathlib import Path
 from functools import wraps
@@ -263,11 +264,27 @@ def _run_job(job_id, mode):
         _update_job(job_id, status=final_status)
 
     except Exception as e:
+        tb = traceback.format_exc()
+
+        print("====== JOB FAILED WITH TRACEBACK ======")
+        print(tb)
+        print("=======================================")
+
         _append_log(job_id, {
-            "po": "—", "status": "error", "msg": str(e),
+            "po": "—",
+            "status": "error",
+            "msg": f"{type(e).__name__}: {e}",
             "ts": datetime.now(UTC).isoformat()
         })
-        _update_job(job_id, status="error", error=str(e))
+
+        _append_log(job_id, {
+            "po": "—",
+            "status": "traceback",
+            "msg": tb,
+            "ts": datetime.now(UTC).isoformat()
+        })
+
+        _update_job(job_id, status="error", error=tb)
 
 
 @app.route("/api/submit", methods=["POST"])
