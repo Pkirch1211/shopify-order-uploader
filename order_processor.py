@@ -16,7 +16,7 @@ from shopify_core import (
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
-print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_COMPLETE_V3_LOADED ======")
+print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_COMPLETE_V4_PRICE_OVERRIDE_CLEAN_NOTE_LOADED ======")
 print(f"====== DRY_RUN={DRY_RUN} ======")
 
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
@@ -927,8 +927,20 @@ def _try_order_create(order_input, options, note):
     return order_id, dfs, errs, out
 
 
+def _money_input_from_amount(amount) -> Optional[dict]:
+    parsed = _parse_decimal(amount)
+    if parsed is None:
+        return None
+
+    return {
+        "amount": _money_str(parsed),
+        "currencyCode": _shop_currency(),
+    }
+
+
 def _draft_line_items_from_order_line_items(order_line_items: List[dict]) -> List[dict]:
     draft_items = []
+    override_count = 0
 
     for li in order_line_items:
         qty = int(li.get("quantity") or 0)
@@ -942,18 +954,35 @@ def _draft_line_items_from_order_line_items(order_line_items: List[dict]) -> Lis
         price_set = li.get("priceSet") or {}
         shop_money = price_set.get("shopMoney") or {}
         amount = shop_money.get("amount")
+        money_input = _money_input_from_amount(amount)
 
         if li.get("variantId"):
             draft_li["variantId"] = li["variantId"]
-            if amount is not None:
-                draft_li["originalUnitPrice"] = float(amount)
+
+            if money_input:
+                draft_li["priceOverride"] = money_input
+                override_count += 1
+
         else:
             draft_li["title"] = li.get("title") or li.get("sku") or "Item"
+
             if li.get("sku"):
                 draft_li["sku"] = li.get("sku")
-            draft_li["originalUnitPrice"] = float(amount if amount is not None else 0.01)
+
+            if money_input:
+                draft_li["originalUnitPriceWithCurrency"] = money_input
+            else:
+                draft_li["originalUnitPriceWithCurrency"] = {
+                    "amount": "0.01",
+                    "currencyCode": _shop_currency(),
+                }
 
         draft_items.append(draft_li)
+
+    print("====== DRAFT LINE ITEM PRICE OVERRIDE SUMMARY ======")
+    print(f"Total draft line items: {len(draft_items)}")
+    print(f"Variant priceOverride count: {override_count}")
+    print("===================================================")
 
     return draft_items
 
@@ -970,7 +999,7 @@ def _try_draft_order_create(
 
     draft_input = {
         "lineItems": draft_line_items,
-        "note": _build_draft_note(order),
+        "note": order.get("specialInstructions") or "",
         "tags": ["excel-import", "dry-run-draft"],
         "billingAddress": order_input.get("billingAddress"),
         "shippingAddress": order_input.get("shippingAddress"),
