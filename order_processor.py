@@ -16,7 +16,7 @@ from shopify_core import (
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
-print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_UPDATE_V2_FREE_FREIGHT_ZERO_SHIP_LOADED ======")
+print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_COMPLETE_V3_LOADED ======")
 print(f"====== DRY_RUN={DRY_RUN} ======")
 
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
@@ -95,6 +95,46 @@ mutation UpdateDraftOrder($id: ID!, $input: DraftOrderInput!) {
           }
         }
       }
+      order {
+        id
+        name
+        tags
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+DRAFT_COMPLETE_MUTATION = """
+mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean!) {
+  draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+    draftOrder {
+      id
+      name
+      order {
+        id
+        name
+        tags
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+DRAFT_COMPLETE_MUTATION_FREE = """
+mutation CompleteDraftOrderFree($id: ID!) {
+  draftOrderComplete(id: $id) {
+    draftOrder {
+      id
+      name
       order {
         id
         name
@@ -571,6 +611,43 @@ def _safe_attach_payment_terms_to_order(order_id: str, order: dict, subtotal: Op
         print(f"WARNING: Order {order_id} created, but payment terms failed: {terms_exc}")
 
 
+
+def _complete_draft_order(draft_id: str, is_free: bool = False) -> dict:
+    print("====== DRAFT COMPLETE REQUEST ======")
+    print(f"Draft ID: {draft_id}")
+    print(f"is_free={is_free}")
+    print("====================================")
+
+    if is_free:
+        out = shopify_graphql(DRAFT_COMPLETE_MUTATION_FREE, {"id": draft_id})
+    else:
+        out = shopify_graphql(
+            DRAFT_COMPLETE_MUTATION,
+            {
+                "id": draft_id,
+                "paymentPending": True,
+            },
+        )
+
+    print("====== DRAFT COMPLETE RAW RESPONSE ======")
+    print(out)
+    print("=========================================")
+
+    payload = _data(out).get("draftOrderComplete", {}) or {}
+    errs = payload.get("userErrors", []) or []
+
+    if errs:
+        raise RuntimeError(f"draftOrderComplete userErrors: {errs}")
+
+    draft = payload.get("draftOrder") or {}
+    order = draft.get("order") or {}
+
+    if not order.get("id"):
+        raise RuntimeError(f"draftOrderComplete returned no order for draft {draft_id}: {payload}")
+
+    return order
+
+
 def _draft_order_update(draft_id: str, input_payload: dict) -> dict:
     print("====== DRAFT ORDER UPDATE REQUEST ======")
     print(f"Draft ID: {draft_id}")
@@ -893,7 +970,7 @@ def _try_draft_order_create(
 
     draft_input = {
         "lineItems": draft_line_items,
-        "note": order.get("specialInstructions") or "",
+        "note": _build_draft_note(order),
         "tags": ["excel-import", "dry-run-draft"],
         "billingAddress": order_input.get("billingAddress"),
         "shippingAddress": order_input.get("shippingAddress"),
@@ -1088,14 +1165,13 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     if freight_action == "no-subtotal-error":
         raise RuntimeError("Could not determine order subtotal for freight calculation")
 
-    print("====== PAYMENT TEMPLATE MAP AT RUNTIME ======")
-    print(f"DEFAULT_PAYMENT_TERMS_TEMPLATE_ID={DEFAULT_PAYMENT_TERMS_TEMPLATE_ID}")
-    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET30={PAYMENT_TEMPLATE_MAP.get(30)}")
-    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET45={PAYMENT_TEMPLATE_MAP.get(45)}")
-    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET60={PAYMENT_TEMPLATE_MAP.get(60)}")
-    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET90={PAYMENT_TEMPLATE_MAP.get(90)}")
-    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET120={PAYMENT_TEMPLATE_MAP.get(120)}")
-    print("============================================")
+    print("====== FREIGHT DETECTION ======")
+    print(f"PO: {order.get('poNumber')}")
+    print(f"Freight action: {freight_action}")
+    print(f"Freight title: {freight_title}")
+    print(f"Freight price: {freight_price}")
+    print(f"Subtotal used: {subtotal_for_terms_and_freight}")
+    print("===============================")
 
     if shipping_lines:
         order_input["shippingLines"] = shipping_lines
@@ -1118,61 +1194,39 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
         "sendFulfillmentReceipt": False,
     }
 
-    if DRY_RUN:
+    draft_id, draft_name, draft_errs, _ = _try_draft_order_create(
+        order=order,
+        order_input=order_input,
+        line_items=line_items,
+        customer_id=customer_id,
+        company_location_id=company_location_id,
+    )
+
+    if not draft_id and company_location_id and customer_id:
         draft_id, draft_name, draft_errs, _ = _try_draft_order_create(
             order=order,
             order_input=order_input,
             line_items=line_items,
             customer_id=customer_id,
-            company_location_id=company_location_id,
+            company_location_id=None,
         )
 
-        if not draft_id and company_location_id and customer_id:
-            draft_id, draft_name, draft_errs, _ = _try_draft_order_create(
-                order=order,
-                order_input=order_input,
-                line_items=line_items,
-                customer_id=customer_id,
-                company_location_id=None,
-            )
+    if not draft_id:
+        raise RuntimeError(f"draftOrderCreate failed. Errors: {draft_errs}")
 
-        if not draft_id:
-            raise RuntimeError(f"DRY_RUN draftOrderCreate failed. Errors: {draft_errs}")
+    latest, post_update_summary = _post_create_update_draft_freight_and_terms(draft_id)
 
-        latest, post_update_summary = _post_create_update_draft_freight_and_terms(draft_id)
+    if DRY_RUN:
         return draft_id, f"DRY_RUN_DRAFT {latest.get('name') or draft_name or ''} | {post_update_summary}".strip()
 
-    order_id, dfs, errs, _ = _try_order_create(order_input, options, "full")
-    if order_id:
-        _safe_attach_payment_terms_to_order(order_id, order, subtotal_for_terms_and_freight)
-        return order_id, dfs
+    subtotal = _draft_subtotal_amount(latest)
+    is_free_order = subtotal is not None and subtotal == Decimal("0.00")
 
-    saved_loc = order_input.pop("companyLocationId", None)
-    order_id, dfs, errs, _ = _try_order_create(order_input, options, "no-companyLocationId")
-    if order_id:
-        _safe_attach_payment_terms_to_order(order_id, order, subtotal_for_terms_and_freight)
-        return order_id, dfs
-    if saved_loc:
-        order_input["companyLocationId"] = saved_loc
+    completed_order = _complete_draft_order(draft_id, is_free=is_free_order)
+    order_id = completed_order.get("id")
+    order_name = completed_order.get("name")
 
-    saved_mf = order_input.pop("metafields", None)
-    order_id, dfs, errs, _ = _try_order_create(order_input, options, "no-metafields")
-    if order_id:
-        _safe_attach_payment_terms_to_order(order_id, order, subtotal_for_terms_and_freight)
-        return order_id, dfs
-    if saved_mf:
-        order_input["metafields"] = saved_mf
-
-    saved_shipping_lines = order_input.pop("shippingLines", None)
-    if saved_shipping_lines:
-        order_id, dfs, errs, _ = _try_order_create(order_input, options, "no-shippingLines")
-        if order_id:
-            _safe_attach_payment_terms_to_order(order_id, order, subtotal_for_terms_and_freight)
-            return order_id, dfs
-
-        order_input["shippingLines"] = saved_shipping_lines
-
-    raise RuntimeError(f"orderCreate failed. Last errors: {errs}")
+    return order_id, f"COMPLETED_FROM_DRAFT {order_name or ''} | {post_update_summary}".strip()
 
 
 def process_live_orders(orders, progress_callback=None, cancel_event=None):
