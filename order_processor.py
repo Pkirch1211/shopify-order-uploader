@@ -1088,13 +1088,14 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     if freight_action == "no-subtotal-error":
         raise RuntimeError("Could not determine order subtotal for freight calculation")
 
-    print("====== FREIGHT DETECTION ======")
-    print(f"PO: {order.get('poNumber')}")
-    print(f"Freight action: {freight_action}")
-    print(f"Freight title: {freight_title}")
-    print(f"Freight price: {freight_price}")
-    print(f"Subtotal used: {subtotal_for_terms_and_freight}")
-    print("===============================")
+    print("====== PAYMENT TEMPLATE MAP AT RUNTIME ======")
+    print(f"DEFAULT_PAYMENT_TERMS_TEMPLATE_ID={DEFAULT_PAYMENT_TERMS_TEMPLATE_ID}")
+    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET30={PAYMENT_TEMPLATE_MAP.get(30)}")
+    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET45={PAYMENT_TEMPLATE_MAP.get(45)}")
+    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET60={PAYMENT_TEMPLATE_MAP.get(60)}")
+    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET90={PAYMENT_TEMPLATE_MAP.get(90)}")
+    print(f"PAYMENT_TERMS_TEMPLATE_ID_NET120={PAYMENT_TEMPLATE_MAP.get(120)}")
+    print("============================================")
 
     if shipping_lines:
         order_input["shippingLines"] = shipping_lines
