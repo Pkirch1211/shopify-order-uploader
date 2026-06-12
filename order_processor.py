@@ -1,21 +1,3 @@
-"""
-Live order creation logic (wraps Script 2 logic — financialStatus=PENDING).
-
-Adds release-instock-orders.py-style:
-
-* Payment terms detection from notes / PO / shipping text
-* Default Net 30
-* Net 30 / 45 / 60 / 90 / 120 template mapping
-* Free freight marker detection
-* Freight calculation as FREIGHT_RATE_PERCENT of subtotal
-* UPS Ground / UPS / FedEx shipping title detection
-
-Important:
-
-* shippingLines are included directly in orderCreate.
-* payment terms are attached after orderCreate via paymentTermsCreate(referenceId=order_id).
-* If payment terms fail after order creation, the order is still treated as created.
-  """
 
 import os
 import re
