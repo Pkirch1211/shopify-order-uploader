@@ -32,6 +32,84 @@ PAYMENT_TEMPLATE_MAP: Dict[int, str] = {
     120: os.getenv("PAYMENT_TERMS_TEMPLATE_ID_NET120", "").strip(),
 }
 
+DRAFT_RECHECK_QUERY = """
+query RecheckDraft($id: ID!) {
+  draftOrder(id: $id) {
+    id
+    name
+    status
+    note2
+    poNumber
+    currencyCode
+    subtotalPriceSet {
+      shopMoney {
+        amount
+        currencyCode
+      }
+    }
+    paymentTerms {
+      id
+      dueInDays
+      translatedName
+      paymentTermsName
+    }
+    shippingLine {
+      id
+      title
+      custom
+      discountedPriceSet {
+        shopMoney {
+          amount
+          currencyCode
+        }
+      }
+    }
+  }
+}
+"""
+
+DRAFT_UPDATE_MUTATION = """
+mutation UpdateDraftOrder($id: ID!, $input: DraftOrderInput!) {
+  draftOrderUpdate(id: $id, input: $input) {
+    draftOrder {
+      id
+      name
+      tags
+      paymentTerms {
+        id
+        dueInDays
+        translatedName
+        paymentTermsName
+      }
+      shippingLine {
+        id
+        title
+        custom
+        discountedPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+      }
+      order {
+        id
+        name
+        tags
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+
+def _data(out: dict) -> dict:
+    return (out.get("data") if isinstance(out, dict) and "data" in out else out) or {}
+
 
 def _shop_currency() -> str:
     return os.getenv("SHOP_CURRENCY", SHOP_CURRENCY or "USD")
@@ -66,6 +144,7 @@ def _build_order_note_blob(order: dict) -> str:
         "poNumber",
         "notes",
         "note",
+        "note2",
         "orderNotes",
         "orderNote",
         "poNotes",
@@ -108,6 +187,25 @@ def _build_order_note_blob(order: dict) -> str:
     print("====== NOTE BLOB USED FOR TERMS/FREIGHT DETECTION ======")
     print(blob or "(empty)")
     print("=======================================================")
+
+    return blob
+
+
+def _build_draft_note(order: dict) -> str:
+    blob = _build_order_note_blob(order)
+    return blob or f"PO: {order.get('poNumber') or ''}".strip()
+
+
+def _build_draft_style_note_blob(draft: dict) -> str:
+    parts = [
+        draft.get("note2") or "",
+        draft.get("poNumber") or "",
+    ]
+    blob = "\n".join(parts).strip()
+
+    print("====== DRAFT NOTE BLOB USED FOR POST-CREATE UPDATE ======")
+    print(blob or "(empty)")
+    print("========================================================")
 
     return blob
 
@@ -217,23 +315,53 @@ def _build_shipping_lines(order: dict, subtotal: Optional[Decimal]) -> Tuple[Lis
     ], "charge-freight", freight_title, freight_price
 
 
-def _draft_shipping_line_from_shipping_lines(shipping_lines: List[dict]) -> Optional[dict]:
-    if not shipping_lines:
-        return None
+def _draft_subtotal_amount(draft: dict) -> Optional[Decimal]:
+    subtotal_set = draft.get("subtotalPriceSet") or {}
+    shop_money = subtotal_set.get("shopMoney") or {}
+    return _parse_decimal(shop_money.get("amount"))
 
-    first = shipping_lines[0] or {}
-    title = first.get("title") or DEFAULT_FREIGHT_TITLE
-    price_set = first.get("priceSet") or {}
-    shop_money = price_set.get("shopMoney") or {}
-    amount = shop_money.get("amount")
 
-    if amount is None:
-        return None
+def _current_shipping_price(draft: dict) -> str:
+    shipping_line = draft.get("shippingLine") or {}
+    discounted = shipping_line.get("discountedPriceSet") or {}
+    shop_money = discounted.get("shopMoney") or {}
+    return (shop_money.get("amount") or "").strip()
 
-    return {
-        "title": title,
-        "price": float(amount),
-    }
+
+def _shipping_line_matches(draft: dict, expected_title: str, expected_price: str) -> bool:
+    shipping_line = draft.get("shippingLine") or {}
+    if not shipping_line:
+        return False
+
+    current_title = (shipping_line.get("title") or "").strip()
+    current_price = _parse_decimal(_current_shipping_price(draft))
+    desired_price = _parse_decimal(expected_price)
+
+    if current_title != expected_title:
+        return False
+    if current_price is None or desired_price is None:
+        return False
+
+    return current_price == desired_price
+
+
+def _build_freight_quote_from_draft(draft: dict) -> Tuple[bool, str, str, str]:
+    blob = _build_draft_style_note_blob(draft)
+
+    if _valid_free_freight_marker_present(blob):
+        return True, "free-freight", "", ""
+
+    subtotal = _draft_subtotal_amount(draft)
+    if subtotal is None:
+        return False, "Could not determine draft subtotal for freight calculation", "", ""
+
+    freight_title = _detect_freight_title(blob)
+    freight_amount = (subtotal * FREIGHT_RATE_PERCENT / Decimal("100")).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+
+    return True, "charge-freight", freight_title, _money_str(freight_amount)
 
 
 def _build_issued_at(now_dt: datetime) -> str:
@@ -246,11 +374,48 @@ def _build_due_at(days_from_today: int, today) -> str:
     return due_at.isoformat().replace("+00:00", "Z")
 
 
-def _build_payment_terms_attributes(order: dict, now_dt: Optional[datetime] = None) -> Tuple[dict, str, int]:
-    now_dt = now_dt or datetime.now(timezone.utc)
-    blob = _build_order_note_blob(order)
+def _payment_terms_name(payment_terms: Optional[dict]) -> str:
+    if not payment_terms:
+        return ""
+    return (
+        payment_terms.get("translatedName")
+        or payment_terms.get("paymentTermsName")
+        or ""
+    )
 
-    detected_days = _detect_net_terms_days(blob)
+
+def _payment_terms_match_detected(payment_terms: Optional[dict], detected_days: Optional[int]) -> bool:
+    if not payment_terms or not detected_days:
+        return False
+
+    name = (_payment_terms_name(payment_terms) or "").strip().upper()
+    due_in_days = payment_terms.get("dueInDays")
+
+    if detected_days in (30, 45, 60, 90):
+        if due_in_days == detected_days:
+            return True
+        if f"NET {detected_days}" in name or f"NET{detected_days}" in name:
+            return True
+        return False
+
+    if detected_days == 120:
+        if "NET 120" in name or "NET120" in name:
+            return True
+        if "FIXED" in name:
+            return True
+        if due_in_days == 120:
+            return True
+        return False
+
+    return False
+
+
+def _build_payment_terms_attributes_from_text(
+    text: str,
+    now_dt: Optional[datetime] = None,
+) -> Tuple[dict, str, int]:
+    now_dt = now_dt or datetime.now(timezone.utc)
+    detected_days = _detect_net_terms_days(text)
 
     if detected_days:
         detected_label = f"Net {detected_days}"
@@ -296,6 +461,10 @@ def _build_payment_terms_attributes(order: dict, now_dt: Optional[datetime] = No
     return attrs, detected_label, detected_days
 
 
+def _build_payment_terms_attributes(order: dict, now_dt: Optional[datetime] = None) -> Tuple[dict, str, int]:
+    return _build_payment_terms_attributes_from_text(_build_order_note_blob(order), now_dt)
+
+
 def _is_issue_date_fixed_terms_error(exc: Exception) -> bool:
     return "issue date cannot be set with event or fixed payment terms" in str(exc).lower()
 
@@ -329,7 +498,7 @@ def _payment_terms_create(order_id: str, payment_terms_attributes: dict) -> dict
         },
     )
 
-    payload = (out.get("data", {}) or {}).get("paymentTermsCreate", {}) or {}
+    payload = _data(out).get("paymentTermsCreate", {}) or {}
     errs = payload.get("userErrors", []) or []
 
     if errs:
@@ -380,6 +549,218 @@ def _safe_attach_payment_terms_to_order(order_id: str, order: dict, subtotal: Op
         print(f"WARNING: Order {order_id} created, but payment terms failed: {terms_exc}")
 
 
+def _draft_order_update(draft_id: str, input_payload: dict) -> dict:
+    out = shopify_graphql(
+        DRAFT_UPDATE_MUTATION,
+        {
+            "id": draft_id,
+            "input": input_payload,
+        },
+    )
+
+    payload = _data(out).get("draftOrderUpdate", {}) or {}
+    errs = payload.get("userErrors", []) or []
+
+    if errs:
+        raise RuntimeError(f"draftOrderUpdate userErrors: {errs}")
+
+    return payload.get("draftOrder") or {}
+
+
+def _recheck_draft(draft_id: str) -> dict:
+    out = shopify_graphql(DRAFT_RECHECK_QUERY, {"id": draft_id})
+    draft = _data(out).get("draftOrder")
+
+    if not draft:
+        raise RuntimeError(f"Draft {draft_id} not found during recheck")
+
+    return draft
+
+
+def _try_update_payment_terms_payloads(
+    draft: dict,
+    payloads: List[Tuple[dict, str]],
+) -> Tuple[bool, str]:
+    last_exc: Optional[Exception] = None
+
+    for payload, description in payloads:
+        try:
+            print(f"Draft {draft.get('name')} | attempting payment terms update: {description}")
+            _draft_order_update(draft["id"], payload)
+            return True, description
+        except Exception as exc:
+            last_exc = exc
+            print(f"Draft {draft.get('name')} | payment terms update attempt failed ({description}): {exc}")
+
+            if _is_issue_date_fixed_terms_error(exc):
+                continue
+
+            raise
+
+    if last_exc:
+        raise last_exc
+
+    return False, "No payment terms payloads were attempted"
+
+
+def _ensure_draft_shipping_logic(draft: dict) -> Tuple[bool, str, str, str, str]:
+    ok, freight_action, freight_title, freight_price = _build_freight_quote_from_draft(draft)
+
+    if not ok:
+        return False, freight_action, freight_title, freight_price, freight_action
+
+    if freight_action == "free-freight":
+        return True, freight_action, freight_title, freight_price, "Valid free-freight marker found; leaving shipping unchanged"
+
+    if _shipping_line_matches(draft, freight_title, freight_price):
+        return True, freight_action, freight_title, freight_price, f"Existing shipping already matches {freight_title} at {freight_price}"
+
+    currency_code = (draft.get("currencyCode") or "").strip() or _shop_currency() or "USD"
+    shipping_payload = {
+        "shippingLine": {
+            "title": freight_title,
+            "priceWithCurrency": {
+                "amount": freight_price,
+                "currencyCode": currency_code,
+            },
+        }
+    }
+
+    print(f"Draft {draft.get('name')} | setting custom shipping to {freight_title} at {freight_price} {currency_code}")
+    _draft_order_update(draft["id"], shipping_payload)
+
+    return True, freight_action, freight_title, freight_price, f"Set shipping to {freight_title} at {freight_price} {currency_code}"
+
+
+def _ensure_draft_payment_terms(draft: dict, now_dt: datetime) -> Tuple[bool, str, str, Optional[int]]:
+    existing = draft.get("paymentTerms")
+    existing_name = _payment_terms_name(existing)
+
+    blob = _build_draft_style_note_blob(draft)
+    attrs, detected_label, detected_days = _build_payment_terms_attributes_from_text(blob, now_dt)
+    template_id = attrs["paymentTermsTemplateId"]
+
+    if detected_days == 120:
+        due_at = attrs.get("paymentSchedules", [{}])[0].get("dueAt")
+        payloads = [
+            (
+                {
+                    "paymentTerms": {
+                        "paymentTermsTemplateId": template_id,
+                        "paymentSchedules": [
+                            {
+                                "dueAt": due_at,
+                            }
+                        ],
+                    }
+                },
+                f"fixed/event-safe update to Net 120 using template {template_id} with dueAt {due_at}",
+            ),
+            (
+                {
+                    "paymentTerms": {
+                        "paymentTermsTemplateId": template_id,
+                    }
+                },
+                f"template-only fallback to Net 120 using template {template_id}",
+            ),
+        ]
+    else:
+        issued_at = attrs.get("paymentSchedules", [{}])[0].get("issuedAt")
+        payloads = [
+            (
+                {
+                    "paymentTerms": {
+                        "paymentTermsTemplateId": template_id,
+                        "paymentSchedules": [
+                            {
+                                "issuedAt": issued_at,
+                            }
+                        ],
+                    }
+                },
+                f"standard update to Net {detected_days} using template {template_id} with issuedAt {issued_at}",
+            ),
+            (
+                {
+                    "paymentTerms": {
+                        "paymentTermsTemplateId": template_id,
+                    }
+                },
+                f"template-only fallback to Net {detected_days} using template {template_id}",
+            ),
+        ]
+
+    print(
+        f"Draft {draft.get('name')} | overriding existing payment terms "
+        f"'{existing_name or 'NONE'}' to {detected_label} using template {template_id}"
+    )
+
+    ok, attempt_description = _try_update_payment_terms_payloads(draft, payloads)
+
+    if not ok:
+        return False, f"Failed to update payment terms to {detected_label}", detected_label, detected_days
+
+    return True, f"Overrode payment terms to {detected_label} ({attempt_description})", detected_label, detected_days
+
+
+def _post_create_update_draft_freight_and_terms(draft_id: str) -> Tuple[dict, str]:
+    now_dt = datetime.now(timezone.utc)
+
+    latest = _recheck_draft(draft_id)
+
+    freight_ok, freight_action, freight_title, freight_price, freight_reason = _ensure_draft_shipping_logic(latest)
+    print(f"{latest.get('name')} | freight-check={freight_ok} | {freight_reason}")
+
+    latest = _recheck_draft(draft_id)
+    current_freight_title = ((latest.get("shippingLine") or {}).get("title") or "").strip()
+    current_freight_price = _current_shipping_price(latest)
+
+    if freight_action == "charge-freight" and not _shipping_line_matches(latest, freight_title, freight_price):
+        raise RuntimeError(
+            f"Expected shipping '{freight_title}' at {freight_price} but Shopify returned "
+            f"'{current_freight_title or 'NONE'}' at {current_freight_price or 'NONE'}"
+        )
+
+    subtotal = _draft_subtotal_amount(latest)
+    is_free_order = subtotal is not None and subtotal == Decimal("0.00")
+
+    if is_free_order:
+        terms_ok = True
+        terms_reason = "Skipped - $0 free order"
+        detected_terms = ""
+        detected_days = None
+    else:
+        terms_ok, terms_reason, detected_terms, detected_days = _ensure_draft_payment_terms(latest, now_dt)
+
+    print(f"{latest.get('name')} | payment-terms-check={terms_ok} | {terms_reason}")
+
+    latest = _recheck_draft(draft_id)
+    payment_terms_after = _payment_terms_name(latest.get("paymentTerms"))
+
+    if detected_terms:
+        if not payment_terms_after:
+            raise RuntimeError(f"Detected {detected_terms} but payment terms are still blank after update")
+        if not _payment_terms_match_detected(latest.get("paymentTerms"), detected_days):
+            raise RuntimeError(
+                f"Detected {detected_terms} but Shopify returned '{payment_terms_after}' after update"
+            )
+
+    summary = (
+        f"freight={freight_action}"
+        + (f" {freight_title} {freight_price}" if freight_title or freight_price else "")
+        + f"; terms={payment_terms_after or terms_reason}"
+    )
+
+    print("====== DRY RUN DRAFT POST-CREATE UPDATE COMPLETE ======")
+    print(f"Draft: {latest.get('name')} / {latest.get('id')}")
+    print(f"Shipping: {((latest.get('shippingLine') or {}).get('title') or 'NONE')} @ {_current_shipping_price(latest) or 'NONE'}")
+    print(f"Payment terms: {payment_terms_after or 'NONE'}")
+    print("======================================================")
+
+    return latest, summary
+
+
 def _try_order_create(order_input, options, note):
     m = """
     mutation($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
@@ -416,7 +797,7 @@ def _try_order_create(order_input, options, note):
     """
 
     out = shopify_graphql(m, {"order": order_input, "options": options or {}})
-    payload = (out.get("data", {}) or {}).get("orderCreate", {}) or {}
+    payload = _data(out).get("orderCreate", {}) or {}
     errs = payload.get("userErrors", []) or []
     created = payload.get("order") or {}
     order_id = created.get("id")
@@ -461,17 +842,14 @@ def _try_draft_order_create(
     order: dict,
     order_input: dict,
     line_items: List[dict],
-    shipping_lines: List[dict],
-    subtotal: Optional[Decimal],
     customer_id,
     company_location_id,
 ) -> Tuple[Optional[str], Optional[str], List[dict], dict]:
     draft_line_items = _draft_line_items_from_order_line_items(line_items)
-    shipping_line = _draft_shipping_line_from_shipping_lines(shipping_lines)
 
     draft_input = {
         "lineItems": draft_line_items,
-        "note": order_input.get("note") or "",
+        "note": _build_draft_note(order),
         "tags": ["excel-import", "dry-run-draft"],
         "billingAddress": order_input.get("billingAddress"),
         "shippingAddress": order_input.get("shippingAddress"),
@@ -481,17 +859,8 @@ def _try_draft_order_create(
         "useCustomerDefaultAddress": False,
     }
 
-    if shipping_line:
-        draft_input["shippingLine"] = shipping_line
-
     if order_input.get("metafields"):
         draft_input["metafields"] = order_input["metafields"]
-
-    if subtotal is None or subtotal != Decimal("0.00"):
-        payment_attrs, detected_label, detected_days = _build_payment_terms_attributes(order)
-        draft_input["paymentTerms"] = payment_attrs
-    else:
-        detected_label = "Skipped - $0.00 order"
 
     if company_location_id:
         draft_input["purchasingEntity"] = {
@@ -504,13 +873,12 @@ def _try_draft_order_create(
             "customerId": to_gid("Customer", customer_id),
         }
 
-    print("====== DRY RUN DRAFT INPUT SUMMARY ======")
+    print("====== DRY RUN DRAFT CREATE INPUT SUMMARY ======")
     print(f"PO: {order.get('poNumber')}")
     print(f"Line item count: {len(draft_line_items)}")
-    print(f"Shipping line payload: {shipping_line}")
-    print(f"Detected payment terms: {detected_label}")
+    print(f"Initial note: {draft_input.get('note')}")
     print(f"Purchasing entity: {draft_input.get('purchasingEntity')}")
-    print("========================================")
+    print("================================================")
 
     m = """
     mutation($input: DraftOrderInput!) {
@@ -520,23 +888,6 @@ def _try_draft_order_create(
           name
           status
           poNumber
-          paymentTerms {
-            id
-            dueInDays
-            translatedName
-            paymentTermsName
-          }
-          shippingLine {
-            id
-            title
-            custom
-            discountedPriceSet {
-              shopMoney {
-                amount
-                currencyCode
-              }
-            }
-          }
         }
         userErrors {
           field
@@ -547,7 +898,7 @@ def _try_draft_order_create(
     """
 
     out = shopify_graphql(m, {"input": draft_input})
-    payload = (out.get("data", {}) or {}).get("draftOrderCreate", {}) or {}
+    payload = _data(out).get("draftOrderCreate", {}) or {}
     errs = payload.get("userErrors", []) or []
     draft = payload.get("draftOrder") or {}
 
@@ -562,13 +913,10 @@ def _try_draft_order_create(
     draft_id = draft.get("id")
     draft_name = draft.get("name")
 
-    print("====== DRY RUN DRAFT CREATED ======")
+    print("====== DRY RUN DRAFT CREATED; NOW POST-UPDATING ======")
     print(f"PO: {order.get('poNumber')}")
     print(f"Draft: {draft_name} / {draft_id}")
-    print(f"Requested shipping line: {shipping_line}")
-    print(f"Returned shipping line: {draft.get('shippingLine')}")
-    print(f"Returned payment terms: {draft.get('paymentTerms')}")
-    print("===================================")
+    print("=====================================================")
 
     return draft_id, draft_name, [], out
 
@@ -730,30 +1078,24 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
             order=order,
             order_input=order_input,
             line_items=line_items,
-            shipping_lines=shipping_lines,
-            subtotal=subtotal_for_terms_and_freight,
             customer_id=customer_id,
             company_location_id=company_location_id,
         )
 
-        if draft_id:
-            return draft_id, f"DRY_RUN_DRAFT {draft_name or ''}".strip()
-
-        if company_location_id and customer_id:
+        if not draft_id and company_location_id and customer_id:
             draft_id, draft_name, draft_errs, _ = _try_draft_order_create(
                 order=order,
                 order_input=order_input,
                 line_items=line_items,
-                shipping_lines=shipping_lines,
-                subtotal=subtotal_for_terms_and_freight,
                 customer_id=customer_id,
                 company_location_id=None,
             )
 
-            if draft_id:
-                return draft_id, f"DRY_RUN_DRAFT {draft_name or ''}".strip()
+        if not draft_id:
+            raise RuntimeError(f"DRY_RUN draftOrderCreate failed. Errors: {draft_errs}")
 
-        raise RuntimeError(f"DRY_RUN draftOrderCreate failed. Errors: {draft_errs}")
+        latest, post_update_summary = _post_create_update_draft_freight_and_terms(draft_id)
+        return draft_id, f"DRY_RUN_DRAFT {latest.get('name') or draft_name or ''} | {post_update_summary}".strip()
 
     order_id, dfs, errs, _ = _try_order_create(order_input, options, "full")
     if order_id:
