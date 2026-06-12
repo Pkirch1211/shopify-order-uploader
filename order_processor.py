@@ -1,21 +1,3 @@
-"""
-Live order creation logic (wraps Script 2 logic — financialStatus=PENDING).
-
-Adds release-instock-orders.py-style:
-- Payment terms detection from notes / PO / shipping text
-- Default Net 30
-- Net 30 / 45 / 60 / 90 / 120 template mapping
-- Free freight marker detection
-- Freight calculation as FREIGHT_RATE_PERCENT of subtotal
-- UPS Ground / UPS / FedEx shipping title detection
-
-Important:
-- DRY_RUN=false creates a live Shopify order.
-- DRY_RUN=true creates a Shopify draft order instead, with payment terms and freight applied.
-- Live order payment terms are attached after orderCreate via paymentTermsCreate(referenceId=order_id).
-- If live order payment terms fail after order creation, the order is still treated as created.
-"""
-
 import os
 import re
 import time
@@ -31,11 +13,6 @@ from shopify_core import (
     get_or_create_matching_contact, grant_ordering_permission, _fix_countries,
     norm_po, SHOP_CURRENCY
 )
-
-
-# =========================
-# CONFIG
-# =========================
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
@@ -56,20 +33,15 @@ PAYMENT_TEMPLATE_MAP: Dict[int, str] = {
 }
 
 
-# =========================
-# MONEY / BASIC HELPERS
-# =========================
-
 def _shop_currency() -> str:
     return os.getenv("SHOP_CURRENCY", SHOP_CURRENCY or "USD")
 
 
 def _price_set(amount):
-    currency = _shop_currency()
     return {
         "shopMoney": {
             "amount": float(round(amount, 2)),
-            "currencyCode": currency,
+            "currencyCode": _shop_currency(),
         }
     }
 
@@ -87,20 +59,57 @@ def _parse_decimal(value) -> Optional[Decimal]:
         return None
 
 
-# =========================
-# NOTE / TEXT DETECTION
-# =========================
-
 def _build_order_note_blob(order: dict) -> str:
-    """
-    Uses likely places where terms/freight notes may appear.
-    """
-    parts = [
-        order.get("specialInstructions") or "",
-        order.get("shippingMethod") or "",
-        order.get("poNumber") or "",
+    candidate_keys = [
+        "specialInstructions",
+        "shippingMethod",
+        "poNumber",
+        "notes",
+        "note",
+        "orderNotes",
+        "orderNote",
+        "poNotes",
+        "poNote",
+        "customerNotes",
+        "customerNote",
+        "internalNotes",
+        "internalNote",
+        "comments",
+        "comment",
+        "memo",
+        "terms",
+        "paymentTerms",
+        "paymentTerm",
+        "shipVia",
+        "shipViaDescription",
+        "shippingInstructions",
+        "freightInstructions",
+        "routing",
+        "carrier",
     ]
-    return "\n".join(str(p) for p in parts if p).strip()
+
+    parts = []
+
+    for key in candidate_keys:
+        value = order.get(key)
+        if value is not None and str(value).strip():
+            parts.append(f"{key}: {value}")
+
+    for key, value in order.items():
+        key_l = str(key).lower()
+        if any(token in key_l for token in ["note", "term", "ship", "freight", "carrier", "routing"]):
+            if value is not None and str(value).strip():
+                entry = f"{key}: {value}"
+                if entry not in parts:
+                    parts.append(entry)
+
+    blob = "\n".join(parts).strip()
+
+    print("====== NOTE BLOB USED FOR TERMS/FREIGHT DETECTION ======")
+    print(blob or "(empty)")
+    print("=======================================================")
+
+    return blob
 
 
 def _normalize_terms_text(text: str) -> str:
@@ -111,16 +120,6 @@ def _normalize_terms_text(text: str) -> str:
 
 
 def _detect_net_terms_days(text: str) -> Optional[int]:
-    """
-    Detects Net 30/45/60/90/120 from flexible user-entered notes.
-
-    Examples:
-    - NET30
-    - Net 30
-    - N30
-    - N-30
-    - Terms: Net 60
-    """
     if not text:
         return None
 
@@ -157,10 +156,6 @@ def _detect_net_terms_days(text: str) -> Optional[int]:
 
 
 def _valid_free_freight_marker_present(text: str) -> bool:
-    """
-    Treats account-shipping instructions as free freight because freight should not
-    be added to the order when the customer provides their shipping account.
-    """
     if not text:
         return False
 
@@ -173,17 +168,11 @@ def _valid_free_freight_marker_present(text: str) -> bool:
         r"\bFEDEXA\b",
         r"\bSHIP\s+(?:FED\s*EX|FEDEX|UPS|DHL|USPS)\s+\w+(?:\s+\w+)?\s+ACCOUNT\s+\d+",
     ]
+
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def _detect_freight_title(text: str) -> str:
-    """
-    Priority:
-    - UPS Ground exact marker => UPS Ground
-    - UPS marker => UPS
-    - FedEx / Fed Ex marker => FedEx
-    - fallback => DEFAULT_FREIGHT_TITLE
-    """
     if not text:
         return DEFAULT_FREIGHT_TITLE
 
@@ -199,26 +188,7 @@ def _detect_freight_title(text: str) -> str:
     return DEFAULT_FREIGHT_TITLE
 
 
-# =========================
-# SHIPPING / FREIGHT
-# =========================
-
 def _build_shipping_lines(order: dict, subtotal: Optional[Decimal]) -> Tuple[List[dict], str, str, str]:
-    """
-    Returns:
-      (shipping_lines, freight_action, freight_title, freight_price)
-
-    freight_action:
-      - free-freight
-      - charge-freight
-      - no-subtotal-error
-
-    For free freight/account-shipping markers:
-      returns no shippingLines so Shopify does not add freight.
-
-    Otherwise:
-      adds one shipping line calculated as FREIGHT_RATE_PERCENT of subtotal.
-    """
     blob = _build_order_note_blob(order)
 
     if _valid_free_freight_marker_present(blob):
@@ -234,7 +204,7 @@ def _build_shipping_lines(order: dict, subtotal: Optional[Decimal]) -> Tuple[Lis
     )
     freight_price = _money_str(freight_amount)
 
-    shipping_lines = [
+    return [
         {
             "title": freight_title,
             "priceSet": {
@@ -244,18 +214,10 @@ def _build_shipping_lines(order: dict, subtotal: Optional[Decimal]) -> Tuple[Lis
                 }
             },
         }
-    ]
-
-    return shipping_lines, "charge-freight", freight_title, freight_price
+    ], "charge-freight", freight_title, freight_price
 
 
 def _draft_shipping_line_from_shipping_lines(shipping_lines: List[dict]) -> Optional[dict]:
-    """
-    Convert live orderCreate shippingLines format to draftOrderCreate shippingLine format.
-
-    Uses priceWithCurrency because that matches the draft update style already used
-    in release-instock-orders.py.
-    """
     if not shipping_lines:
         return None
 
@@ -264,23 +226,15 @@ def _draft_shipping_line_from_shipping_lines(shipping_lines: List[dict]) -> Opti
     price_set = first.get("priceSet") or {}
     shop_money = price_set.get("shopMoney") or {}
     amount = shop_money.get("amount")
-    currency_code = shop_money.get("currencyCode") or _shop_currency()
 
     if amount is None:
         return None
 
     return {
         "title": title,
-        "priceWithCurrency": {
-            "amount": str(amount),
-            "currencyCode": currency_code,
-        },
+        "price": float(amount),
     }
 
-
-# =========================
-# PAYMENT TERMS
-# =========================
 
 def _build_issued_at(now_dt: datetime) -> str:
     return now_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -292,16 +246,7 @@ def _build_due_at(days_from_today: int, today) -> str:
     return due_at.isoformat().replace("+00:00", "Z")
 
 
-def _build_payment_terms_attributes(
-    order: dict,
-    now_dt: Optional[datetime] = None,
-) -> Tuple[dict, str, int]:
-    """
-    Returns:
-      (paymentTermsAttributes, detected_label, detected_days)
-
-    Defaults to Net 30 when nothing is detected.
-    """
+def _build_payment_terms_attributes(order: dict, now_dt: Optional[datetime] = None) -> Tuple[dict, str, int]:
     now_dt = now_dt or datetime.now(timezone.utc)
     blob = _build_order_note_blob(order)
 
@@ -316,6 +261,10 @@ def _build_payment_terms_attributes(
     template_id = (PAYMENT_TEMPLATE_MAP.get(detected_days) or "").strip()
 
     if not template_id:
+        print(
+            f"WARNING: detected Net {detected_days} but no template ID configured; "
+            f"defaulting to Net 30 template {DEFAULT_PAYMENT_TERMS_TEMPLATE_ID}"
+        )
         detected_days = 30
         detected_label = "Net 30 (defaulted)"
         template_id = DEFAULT_PAYMENT_TERMS_TEMPLATE_ID
@@ -324,8 +273,6 @@ def _build_payment_terms_attributes(
         "paymentTermsTemplateId": template_id,
     }
 
-    # Net 120 uses the Fixed template plus dueAt 120 days out.
-    # Normal Net terms use issuedAt.
     if detected_days == 120:
         attrs["paymentSchedules"] = [
             {
@@ -339,6 +286,13 @@ def _build_payment_terms_attributes(
             }
         ]
 
+    print("====== PAYMENT TERMS DETECTION ======")
+    print(f"Detected label: {detected_label}")
+    print(f"Detected days: {detected_days}")
+    print(f"Template ID: {template_id}")
+    print(f"Payload: {attrs}")
+    print("=====================================")
+
     return attrs, detected_label, detected_days
 
 
@@ -347,12 +301,6 @@ def _is_issue_date_fixed_terms_error(exc: Exception) -> bool:
 
 
 def _payment_terms_create(order_id: str, payment_terms_attributes: dict) -> dict:
-    """
-    Attach payment terms to a newly created live order.
-
-    Requires Shopify scope:
-      write_payment_terms
-    """
     m = """
     mutation($referenceId: ID!, $paymentTermsAttributes: PaymentTermsCreateInput!) {
       paymentTermsCreate(
@@ -391,39 +339,30 @@ def _payment_terms_create(order_id: str, payment_terms_attributes: dict) -> dict
 
 
 def _attach_payment_terms_to_order(order_id: str, order: dict, subtotal: Optional[Decimal]) -> dict:
-    """
-    For $0.00 orders, skip payment terms.
-
-    For non-free orders, attach detected/defaulted payment terms.
-    """
     if subtotal is not None and subtotal == Decimal("0.00"):
         return {}
 
     attrs, detected_label, detected_days = _build_payment_terms_attributes(order)
 
-    payloads = []
-
-    # First attempt: full payload with schedule.
-    payloads.append((attrs, f"{detected_label} with schedule"))
-
-    # Fallback: template only.
-    template_only = {
-        "paymentTermsTemplateId": attrs["paymentTermsTemplateId"],
-    }
-    payloads.append((template_only, f"{detected_label} template-only fallback"))
+    payloads = [
+        (attrs, f"{detected_label} with schedule"),
+        ({"paymentTermsTemplateId": attrs["paymentTermsTemplateId"]}, f"{detected_label} template-only fallback"),
+    ]
 
     last_exc = None
 
     for payload, description in payloads:
         try:
+            print(f"Attempting payment terms update for live order: {description}")
             return _payment_terms_create(order_id, payload)
         except Exception as exc:
             last_exc = exc
+            print(f"Payment terms attempt failed ({description}): {exc}")
 
             if _is_issue_date_fixed_terms_error(exc):
                 continue
 
-            if payload is not template_only:
+            if payload is not payloads[-1][0]:
                 continue
 
             raise
@@ -435,21 +374,11 @@ def _attach_payment_terms_to_order(order_id: str, order: dict, subtotal: Optiona
 
 
 def _safe_attach_payment_terms_to_order(order_id: str, order: dict, subtotal: Optional[Decimal]) -> None:
-    """
-    Payment terms are applied after live order creation.
-
-    If this fails, do not make the entire order upload look failed, because the
-    Shopify order already exists.
-    """
     try:
         _attach_payment_terms_to_order(order_id, order, subtotal)
     except Exception as terms_exc:
         print(f"WARNING: Order {order_id} created, but payment terms failed: {terms_exc}")
 
-
-# =========================
-# ORDER CREATE / DRAFT CREATE
-# =========================
 
 def _try_order_create(order_input, options, note):
     m = """
@@ -497,12 +426,6 @@ def _try_order_create(order_input, options, note):
 
 
 def _draft_line_items_from_order_line_items(order_line_items: List[dict]) -> List[dict]:
-    """
-    Convert OrderCreateOrderLineItemInput-style line items to DraftOrderLineItemInput.
-
-    Variant-backed lines keep variantId + quantity.
-    Custom lines use title / sku / originalUnitPrice.
-    """
     draft_items = []
 
     for li in order_line_items:
@@ -520,17 +443,12 @@ def _draft_line_items_from_order_line_items(order_line_items: List[dict]) -> Lis
 
         if li.get("variantId"):
             draft_li["variantId"] = li["variantId"]
-
-            # Preserve overridden price, if there was one.
             if amount is not None:
                 draft_li["originalUnitPrice"] = float(amount)
-
         else:
             draft_li["title"] = li.get("title") or li.get("sku") or "Item"
-
             if li.get("sku"):
                 draft_li["sku"] = li.get("sku")
-
             draft_li["originalUnitPrice"] = float(amount if amount is not None else 0.01)
 
         draft_items.append(draft_li)
@@ -548,12 +466,6 @@ def _try_draft_order_create(
     customer_id,
     company_location_id,
 ) -> Tuple[Optional[str], Optional[str], List[dict], dict]:
-    """
-    DRY_RUN=true mode:
-    Create a Shopify draft order instead of a live order.
-
-    This lets us inspect payment terms + shipping/freight safely before creating real orders.
-    """
     draft_line_items = _draft_line_items_from_order_line_items(line_items)
     shipping_line = _draft_shipping_line_from_shipping_lines(shipping_lines)
 
@@ -581,8 +493,6 @@ def _try_draft_order_create(
     else:
         detected_label = "Skipped - $0.00 order"
 
-    # For draft orders, try B2B company location first.
-    # If Shopify rejects this shape, create_live_order retries as customer-only.
     if company_location_id:
         draft_input["purchasingEntity"] = {
             "purchasingCompany": {
@@ -593,6 +503,14 @@ def _try_draft_order_create(
         draft_input["purchasingEntity"] = {
             "customerId": to_gid("Customer", customer_id),
         }
+
+    print("====== DRY RUN DRAFT INPUT SUMMARY ======")
+    print(f"PO: {order.get('poNumber')}")
+    print(f"Line item count: {len(draft_line_items)}")
+    print(f"Shipping line payload: {shipping_line}")
+    print(f"Detected payment terms: {detected_label}")
+    print(f"Purchasing entity: {draft_input.get('purchasingEntity')}")
+    print("========================================")
 
     m = """
     mutation($input: DraftOrderInput!) {
@@ -647,8 +565,9 @@ def _try_draft_order_create(
     print("====== DRY RUN DRAFT CREATED ======")
     print(f"PO: {order.get('poNumber')}")
     print(f"Draft: {draft_name} / {draft_id}")
-    print(f"Detected payment terms: {detected_label}")
-    print(f"Shipping line: {shipping_line}")
+    print(f"Requested shipping line: {shipping_line}")
+    print(f"Returned shipping line: {draft.get('shippingLine')}")
+    print(f"Returned payment terms: {draft.get('paymentTerms')}")
     print("===================================")
 
     return draft_id, draft_name, [], out
@@ -659,10 +578,8 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
 
     if order.get("poNumber"):
         note_parts.append(f"PO: {order['poNumber']}")
-
     if order.get("specialInstructions"):
         note_parts.append(str(order["specialInstructions"]))
-
     if order.get("shippingMethod"):
         note_parts.append(f"Shipping: {order['shippingMethod']}")
 
@@ -694,7 +611,6 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
 
                     if effective is not None:
                         subtotal_for_freight += Decimal(str(effective)) * Decimal(child_qty)
-
                         if shop_price is None or abs(effective - shop_price) > 1e-9:
                             li["priceSet"] = _price_set(float(effective))
                     else:
@@ -705,7 +621,6 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
                 else:
                     effective = parsed_child_price if parsed_child_price is not None else 0.01
                     subtotal_for_freight += Decimal(str(effective)) * Decimal(child_qty)
-
                     line_items.append({
                         "title": child_sku,
                         "sku": child_sku,
@@ -727,7 +642,6 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
 
             if effective is not None:
                 subtotal_for_freight += Decimal(str(effective)) * Decimal(qty)
-
                 if shop_price is None or abs(effective - shop_price) > 1e-9:
                     li["priceSet"] = _price_set(float(effective))
             else:
@@ -738,7 +652,6 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
         else:
             effective = parsed_price if parsed_price is not None else 0.01
             subtotal_for_freight += Decimal(str(effective)) * Decimal(qty)
-
             line_items.append({
                 "title": item.get("name") or (sku or "Item"),
                 "sku": sku or None,
@@ -756,25 +669,11 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     metafields = []
 
     if ship_date_val:
-        metafields.append({
-            "namespace": "b2b",
-            "key": "ship_date",
-            "value": ship_date_val,
-        })
-
+        metafields.append({"namespace": "b2b", "key": "ship_date", "value": ship_date_val})
     if bill_to_email_val:
-        metafields.append({
-            "namespace": "b2b",
-            "key": "bill_to_email",
-            "value": bill_to_email_val,
-        })
-
+        metafields.append({"namespace": "b2b", "key": "bill_to_email", "value": bill_to_email_val})
     if po_num_val:
-        metafields.append({
-            "namespace": "b2b",
-            "key": "po_number",
-            "value": po_num_val,
-        })
+        metafields.append({"namespace": "b2b", "key": "po_number", "value": po_num_val})
 
     order_input = {
         "lineItems": line_items,
@@ -797,6 +696,14 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     if freight_action == "no-subtotal-error":
         raise RuntimeError("Could not determine order subtotal for freight calculation")
 
+    print("====== FREIGHT DETECTION ======")
+    print(f"PO: {order.get('poNumber')}")
+    print(f"Freight action: {freight_action}")
+    print(f"Freight title: {freight_title}")
+    print(f"Freight price: {freight_price}")
+    print(f"Subtotal used: {subtotal_for_terms_and_freight}")
+    print("===============================")
+
     if shipping_lines:
         order_input["shippingLines"] = shipping_lines
 
@@ -818,7 +725,6 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
         "sendFulfillmentReceipt": False,
     }
 
-    # DRY_RUN=true creates a draft order instead of a live order.
     if DRY_RUN:
         draft_id, draft_name, draft_errs, _ = _try_draft_order_create(
             order=order,
@@ -833,7 +739,6 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
         if draft_id:
             return draft_id, f"DRY_RUN_DRAFT {draft_name or ''}".strip()
 
-        # Fallback: if B2B purchasingEntity caused a draft error, retry as customer only.
         if company_location_id and customer_id:
             draft_id, draft_name, draft_errs, _ = _try_draft_order_create(
                 order=order,
@@ -850,35 +755,27 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
 
         raise RuntimeError(f"DRY_RUN draftOrderCreate failed. Errors: {draft_errs}")
 
-    # Attempt 1: full payload
     order_id, dfs, errs, _ = _try_order_create(order_input, options, "full")
     if order_id:
         _safe_attach_payment_terms_to_order(order_id, order, subtotal_for_terms_and_freight)
         return order_id, dfs
 
-    # Attempt 2: remove companyLocationId fallback
     saved_loc = order_input.pop("companyLocationId", None)
     order_id, dfs, errs, _ = _try_order_create(order_input, options, "no-companyLocationId")
     if order_id:
         _safe_attach_payment_terms_to_order(order_id, order, subtotal_for_terms_and_freight)
         return order_id, dfs
-
     if saved_loc:
         order_input["companyLocationId"] = saved_loc
 
-    # Attempt 3: remove metafields fallback
     saved_mf = order_input.pop("metafields", None)
     order_id, dfs, errs, _ = _try_order_create(order_input, options, "no-metafields")
     if order_id:
         _safe_attach_payment_terms_to_order(order_id, order, subtotal_for_terms_and_freight)
         return order_id, dfs
-
     if saved_mf:
         order_input["metafields"] = saved_mf
 
-    # Attempt 4: remove shippingLines fallback, but only if shipping was present.
-    # This avoids freight blocking the entire order. If this path succeeds,
-    # the order should be reviewed because freight was not applied.
     saved_shipping_lines = order_input.pop("shippingLines", None)
     if saved_shipping_lines:
         order_id, dfs, errs, _ = _try_order_create(order_input, options, "no-shippingLines")
@@ -891,29 +788,11 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     raise RuntimeError(f"orderCreate failed. Last errors: {errs}")
 
 
-# =========================
-# BATCH PROCESSING
-# =========================
-
 def process_live_orders(orders, progress_callback=None, cancel_event=None):
-    """
-    Process a list of orders as live orders.
-
-    DRY_RUN=false:
-      Creates live Shopify orders with financialStatus=PENDING.
-
-    DRY_RUN=true:
-      Creates Shopify draft orders with freight and payment terms applied.
-
-    cancel_event: threading.Event — if set, processing stops before the next order.
-
-    Returns list of result dicts.
-    """
     results = []
     seen_pos = set()
 
     for order in orders:
-        # Cancellation check — stops before starting the next order
         if cancel_event and cancel_event.is_set():
             if progress_callback:
                 progress_callback("—", "cancelled", "Job cancelled — remaining orders skipped")
@@ -927,12 +806,7 @@ def process_live_orders(orders, progress_callback=None, cancel_event=None):
         _fix_countries(order)
 
         if po_norm in seen_pos:
-            results.append({
-                "po": po_number,
-                "status": "skipped",
-                "reason": "Duplicate in file",
-                "id": None,
-            })
+            results.append({"po": po_number, "status": "skipped", "reason": "Duplicate in file", "id": None})
             continue
 
         if progress_callback:
@@ -941,31 +815,17 @@ def process_live_orders(orders, progress_callback=None, cancel_event=None):
 
         if po_number and order_po_exists_in_shopify(po_number):
             seen_pos.add(po_norm)
-            results.append({
-                "po": po_number,
-                "status": "skipped",
-                "reason": "Already exists in Shopify",
-                "id": None,
-            })
-
+            results.append({"po": po_number, "status": "skipped", "reason": "Already exists in Shopify", "id": None})
             if progress_callback:
                 progress_callback(po_number, "skipped", "Already exists in Shopify")
-
             continue
 
         try:
             customer_id, created = create_or_find_customer(order, po_number)
         except Exception as e:
-            results.append({
-                "po": po_number,
-                "status": "error",
-                "reason": str(e),
-                "id": None,
-            })
-
+            results.append({"po": po_number, "status": "error", "reason": str(e), "id": None})
             if progress_callback:
                 progress_callback(po_number, "error", str(e))
-
             seen_pos.add(po_norm)
             continue
 
@@ -1011,13 +871,7 @@ def process_live_orders(orders, progress_callback=None, cancel_event=None):
                 progress_callback(po_number, "created", f"{created_label}: {order_id}")
 
         except Exception as e:
-            results.append({
-                "po": po_number,
-                "status": "error",
-                "reason": str(e),
-                "id": None,
-            })
-
+            results.append({"po": po_number, "status": "error", "reason": str(e), "id": None})
             if progress_callback:
                 progress_callback(po_number, "error", str(e))
 
