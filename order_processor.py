@@ -893,7 +893,7 @@ def _try_draft_order_create(
 
     draft_input = {
         "lineItems": draft_line_items,
-        "note": _build_draft_note(order),
+        "note": order.get("specialInstructions") or "",
         "tags": ["excel-import", "dry-run-draft"],
         "billingAddress": order_input.get("billingAddress"),
         "shippingAddress": order_input.get("shippingAddress"),
