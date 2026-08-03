@@ -993,6 +993,8 @@ def _try_draft_order_create(
     order_input: dict,
     line_items: List[dict],
     customer_id,
+    company_id,
+    company_contact_id,
     company_location_id,
 ) -> Tuple[Optional[str], Optional[str], List[dict], dict]:
     draft_line_items = _draft_line_items_from_order_line_items(line_items)
@@ -1013,10 +1015,13 @@ def _try_draft_order_create(
         draft_input["metafields"] = order_input["metafields"]
 
     if company_location_id:
+        purchasing_company = {"companyLocationId": company_location_id}
+        if company_id:
+            purchasing_company["companyId"] = company_id
+        if company_contact_id:
+            purchasing_company["companyContactId"] = company_contact_id
         draft_input["purchasingEntity"] = {
-            "purchasingCompany": {
-                "companyLocationId": company_location_id,
-            }
+            "purchasingCompany": purchasing_company
         }
     elif customer_id:
         draft_input["purchasingEntity"] = {
@@ -1228,15 +1233,23 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
         order_input=order_input,
         line_items=line_items,
         customer_id=customer_id,
+        company_id=company_id,
+        company_contact_id=company_contact_id,
         company_location_id=company_location_id,
     )
 
     if not draft_id and company_location_id and customer_id:
+        print("====== FALLBACK: RETRYING WITHOUT COMPANY/PURCHASING ENTITY ======")
+        print(f"PO: {order.get('poNumber')}")
+        print(f"First attempt errors: {draft_errs}")
+        print("===================================================================")
         draft_id, draft_name, draft_errs, _ = _try_draft_order_create(
             order=order,
             order_input=order_input,
             line_items=line_items,
             customer_id=customer_id,
+            company_id=None,
+            company_contact_id=None,
             company_location_id=None,
         )
 
