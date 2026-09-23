@@ -12,6 +12,110 @@ from shopify_core import (
 import time
 
 
+# ---------------------------------------------------------------------------
+# Template extras: order tags + metafields
+#
+#   order_tags      -> comma-separated, e.g. "trade-show, fall-26"
+#   mt_repgroup_id  -> b2b.mt_repgroup_id
+#   mt_record_id    -> b2b.mt_record_id
+#
+# Tags are unioned across all rows of a PO. For metafields, the first
+# non-empty value across the PO's rows wins.
+# ---------------------------------------------------------------------------
+
+TAGS_COLUMN = "order_tags"
+COLUMN_METAFIELDS = {
+    # column header: (namespace, key, type)
+    "mt_repgroup_id": ("b2b", "mt_repgroup_id", "single_line_text_field"),
+    "mt_record_id":   ("b2b", "mt_record_id",   "single_line_text_field"),
+}
+DEFAULT_MF_TYPE = "single_line_text_field"
+BASE_TAGS = ["excel-import"]
+
+
+def _clean_cell(val):
+    if val is None:
+        return None
+    # Excel/pandas turn numeric IDs into floats (12345 -> 12345.0)
+    if isinstance(val, float):
+        if val != val:  # NaN
+            return None
+        if val.is_integer():
+            return str(int(val))
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return None
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def _normalize_tags(raw):
+    if not raw:
+        return []
+    parts = raw.split(",") if isinstance(raw, str) else list(raw)
+    out, seen = [], set()
+    for t in parts:
+        t = str(t).strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def extract_order_extras(rows):
+    """
+    Call from the CSV parser with all raw row dicts belonging to one PO.
+    Returns {"tags": [...], "customMetafields": [...]} to merge into the order dict.
+    """
+    tags = []
+    mf_values = {}
+
+    for row in rows or []:
+        for header, val in (row or {}).items():
+            if header is None:
+                continue
+            h = str(header).strip().lower()
+            v = _clean_cell(val)
+            if v is None:
+                continue
+
+            if h == TAGS_COLUMN:
+                tags.extend(v.split(","))
+            elif h in COLUMN_METAFIELDS and h not in mf_values:
+                mf_values[h] = v
+
+    mfs = []
+    for col, v in mf_values.items():
+        ns, key, mf_type = COLUMN_METAFIELDS[col]
+        mfs.append({"namespace": ns, "key": key, "value": v, "type": mf_type})
+
+    return {"tags": _normalize_tags(tags), "customMetafields": mfs}
+
+
+def _build_custom_metafields(raw, reserved_keys):
+    out = []
+    for mf in raw or []:
+        ns = (mf.get("namespace") or "").strip()
+        key = (mf.get("key") or "").strip()
+        val = _clean_cell(mf.get("value"))
+        if not ns or not key or val is None:
+            continue
+        if (ns, key) in reserved_keys:
+            continue  # core b2b fields always come from the standard columns
+        out.append({
+            "namespace": ns,
+            "key": key,
+            "value": val,
+            "type": (mf.get("type") or DEFAULT_MF_TYPE).strip(),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Draft creation
+# ---------------------------------------------------------------------------
+
 def _try_draft_create(input_obj, note):
     m = """
     mutation($input: DraftOrderInput!) {
@@ -36,7 +140,7 @@ def _force_min_price_on_custom_items(input_obj, min_price=0.01):
                 li["originalUnitPrice"] = float(min_price)
 
 
-def create_draft_order(order, customer_id, company_id, company_contact_id, company_location_id):
+def create_draft_order(order, customer_id, company_id, company_contact_id, company_location_id, warnings=None):
     note_parts = []
     if order.get("poNumber"):
         note_parts.append(f"PO: {order['poNumber']}")
@@ -116,17 +220,24 @@ def create_draft_order(order, customer_id, company_id, company_contact_id, compa
     if po_num_val:
         metafields.append({"namespace": "b2b", "key": "po_number", "value": po_num_val})
 
+    core_keys = {(m["namespace"], m["key"]) for m in metafields}
+    core_keys |= {("b2b", "ship_date"), ("b2b", "bill_to_email"), ("b2b", "po_number")}
+    custom_mf = _build_custom_metafields(order.get("customMetafields"), core_keys)
+    all_mf = metafields + custom_mf
+
+    tags = _normalize_tags(BASE_TAGS + _normalize_tags(order.get("tags")))
+
     input_obj = {
         "lineItems": line_items,
         "note": " | ".join([p for p in note_parts if p]),
-        "tags": ["excel-import"],
+        "tags": tags,
         "billingAddress": to_mailing_address(order, "billing"),
         "shippingAddress": to_mailing_address(order, "shipping"),
         "poNumber": order.get("poNumber"),
         "email": order.get("shipToEmail") or order.get("billToEmail") or None,
     }
-    if metafields:
-        input_obj["metafields"] = metafields
+    if all_mf:
+        input_obj["metafields"] = all_mf
 
     if company_id and company_contact_id and company_location_id:
         input_obj["purchasingEntity"] = {
@@ -139,28 +250,55 @@ def create_draft_order(order, customer_id, company_id, company_contact_id, compa
     elif customer_id:
         input_obj["purchasingEntity"] = {"customerId": to_gid("Customer", customer_id)}
 
+    dropped = []
+
+    def _ok(did, first_errs=None):
+        if warnings is not None and dropped:
+            msg = "Dropped on retry: " + ", ".join(dropped)
+            if first_errs:
+                msg += " | first error: " + "; ".join(e.get("message", "") for e in first_errs)
+            warnings.append(msg)
+        return did
+
     draft_id, errs, _ = _try_draft_create(input_obj, "full")
     if draft_id:
         return draft_id
+    first_errs = errs
+
+    # A bad custom metafield (wrong type, bad namespace) shouldn't cost us the
+    # company link or the core b2b metafields — shed custom ones first.
+    if custom_mf:
+        if metafields:
+            input_obj["metafields"] = metafields
+        else:
+            input_obj.pop("metafields", None)
+        dropped.append("custom metafields")
+        draft_id, errs, _ = _try_draft_create(input_obj, "no-custom-metafields")
+        if draft_id:
+            return _ok(draft_id, first_errs)
 
     pe = input_obj.pop("purchasingEntity", None)
     if pe:
         draft_id, errs, _ = _try_draft_create(input_obj, "no-purchasingEntity")
         if draft_id:
-            return draft_id
+            dropped.append("purchasing entity")
+            return _ok(draft_id, first_errs)
         input_obj["purchasingEntity"] = pe
 
     saved_mf = input_obj.pop("metafields", None)
     draft_id, errs, _ = _try_draft_create(input_obj, "no-metafields")
     if draft_id:
-        return draft_id
+        if saved_mf:
+            dropped.append("all metafields")
+        return _ok(draft_id, first_errs)
     if saved_mf:
         input_obj["metafields"] = saved_mf
 
     _force_min_price_on_custom_items(input_obj, 0.01)
     draft_id, errs, _ = _try_draft_create(input_obj, "force-min-custom-price")
     if draft_id:
-        return draft_id
+        dropped.append("custom item prices forced to $0.01")
+        return _ok(draft_id, first_errs)
 
     raise RuntimeError(f"draftOrderCreate failed. Last errors: {errs}")
 
@@ -225,14 +363,25 @@ def process_draft_orders(orders, progress_callback=None, cancel_event=None):
                     grant_ordering_permission(company_contact_id, company_location_id, company_id)
 
         try:
-            draft_id = create_draft_order(order, customer_id, company_id, company_contact_id, company_location_id)
+            warnings = []
+            draft_id = create_draft_order(
+                order, customer_id, company_id, company_contact_id, company_location_id,
+                warnings=warnings,
+            )
+            reason = "Draft created"
+            if warnings:
+                reason += " — " + " | ".join(warnings)
             results.append({
-                "po": po_number, "status": "created", "reason": "Draft created",
+                "po": po_number, "status": "created", "reason": reason,
                 "id": draft_id, "company": billToName,
                 "line_count": len(order.get("details", [])),
+                "warnings": warnings,
             })
             if progress_callback:
-                progress_callback(po_number, "created", f"Draft created: {draft_id}")
+                msg = f"Draft created: {draft_id}"
+                if warnings:
+                    msg += " — " + " | ".join(warnings)
+                progress_callback(po_number, "created", msg)
         except Exception as e:
             results.append({"po": po_number, "status": "error", "reason": str(e), "id": None})
             if progress_callback:
