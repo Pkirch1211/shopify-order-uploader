@@ -16,7 +16,7 @@ from shopify_core import (
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
-print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_COMPLETE_V4_PRICE_OVERRIDE_CLEAN_NOTE_LOADED ======")
+print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_COMPLETE_V5_ZERO_FREIGHT_OK ======")
 print(f"====== DRY_RUN={DRY_RUN} ======")
 
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
@@ -386,12 +386,21 @@ def _current_shipping_price(draft: dict) -> str:
 
 def _shipping_line_matches(draft: dict, expected_title: str, expected_price: str) -> bool:
     shipping_line = draft.get("shippingLine") or {}
+    desired_price = _parse_decimal(expected_price)
+
+    # Shopify silently drops $0.00 custom shipping lines on drafts. When the
+    # expected freight is $0 (free freight or $0 subtotal), a missing or $0
+    # shipping line is the correct end state — don't fail on the title.
+    if desired_price is not None and desired_price == Decimal("0"):
+        current_zero = _parse_decimal(_current_shipping_price(draft))
+        if not shipping_line or current_zero is None or current_zero == Decimal("0"):
+            return True
+
     if not shipping_line:
         return False
 
     current_title = (shipping_line.get("title") or "").strip()
     current_price = _parse_decimal(_current_shipping_price(draft))
-    desired_price = _parse_decimal(expected_price)
 
     if current_title != expected_title:
         return False
