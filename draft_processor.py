@@ -32,6 +32,10 @@ COLUMN_METAFIELDS = {
 DEFAULT_MF_TYPE = "single_line_text_field"
 BASE_TAGS = ["excel-import"]
 
+# originalUnitPrice is ignored by Shopify on variant line items, so a price
+# ABOVE catalog must go through priceOverride (presentment currency).
+PRICE_OVERRIDE_CURRENCY = "USD"
+
 
 def _clean_cell(val):
     if val is None:
@@ -169,6 +173,7 @@ def create_draft_order(order, customer_id, company_id, company_contact_id, compa
                                 li["appliedDiscount"] = {"value": float(diff), "valueType": "FIXED_AMOUNT", "title": "Excel price match"}
                         elif parsed_child_price > shop_price:
                             li["originalUnitPrice"] = float(parsed_child_price)
+                            li["priceOverride"] = {"amount": str(round(parsed_child_price, 2)), "currencyCode": PRICE_OVERRIDE_CURRENCY}
                         else:
                             li["originalUnitPrice"] = float(shop_price)
                     elif shop_price is not None:
@@ -194,6 +199,7 @@ def create_draft_order(order, customer_id, company_id, company_contact_id, compa
                         li["appliedDiscount"] = {"value": float(diff), "valueType": "FIXED_AMOUNT", "title": "Excel price match"}
                 elif parsed_price > shop_price:
                     li["originalUnitPrice"] = float(parsed_price)
+                    li["priceOverride"] = {"amount": str(round(parsed_price, 2)), "currencyCode": PRICE_OVERRIDE_CURRENCY}
                 else:
                     li["originalUnitPrice"] = float(shop_price)
             elif shop_price is not None:
