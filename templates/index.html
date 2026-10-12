@@ -281,6 +281,17 @@
 
   .processing-label { display: flex; align-items: center; gap: 10px; font-family: var(--cond); font-size: 13px; font-weight: 700; letter-spacing: 0.15em; text-transform: uppercase; color: var(--sage); }
 
+  /* ---- Fulfillment options ---- */
+  .opt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+  .opt-box { background: var(--cream); border: 1px solid var(--border); border-radius: 4px; padding: 14px 16px; }
+  .opt-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 8px; display: block; }
+  .opt-select { width: 100%; padding: 9px 10px; border: 1px solid var(--border-mid); border-radius: 4px; background: #fff; font-family: var(--body); font-size: 14px; color: var(--text); }
+  .opt-select:disabled { opacity: 0.5; }
+  .opt-hint { font-family: var(--mono); font-size: 10.5px; color: var(--text-dim); margin-top: 6px; line-height: 1.4; }
+  .opt-check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; font-size: 13px; color: var(--text); }
+  .opt-check input { margin-top: 3px; accent-color: var(--sage); }
+  @media (max-width: 640px) { .opt-grid, .mode-grid, .stats-row { grid-template-columns: 1fr; } }
+
   .hidden { display: none !important; }
 </style>
 </head>
@@ -381,6 +392,22 @@
         </div>
         <div id="mode-warning" class="hidden" style="margin-bottom:16px;">
           <div class="alert alert-warn">⚠ <div><strong>Live Order mode selected.</strong> Orders will be created immediately in your Shopify store. Duplicate POs are checked and skipped automatically.</div></div>
+        </div>
+        <div class="opt-grid">
+          <div class="opt-box">
+            <label class="opt-label" for="location-select">Fulfillment Location</label>
+            <select class="opt-select" id="location-select">
+              <option value="">Shopify default routing</option>
+            </select>
+            <div class="opt-hint" id="location-hint">Live orders only · moved right after each order is created</div>
+          </div>
+          <div class="opt-box">
+            <span class="opt-label">PDQ / Assortment SKUs</span>
+            <label class="opt-check">
+              <input type="checkbox" id="expand-assortments" checked>
+              <span>Expand into component SKUs<br><span class="opt-hint" style="margin-top:2px;display:block">Uncheck to keep e.g. LL-00-0015 as one line</span></span>
+            </label>
+          </div>
         </div>
         <div class="confirm-bar">
           <div class="confirm-bar-text">
@@ -528,7 +555,45 @@ function renderReview(data) {
   if (s.po_count > 50) document.getElementById('preview-overflow').classList.remove('hidden');
 }
 
-document.getElementById('btn-to-mode').addEventListener('click', () => { setStep(3); showPhase('mode'); });
+document.getElementById('btn-to-mode').addEventListener('click', () => { setStep(3); showPhase('mode'); loadLocations(); });
+
+let locationsLoaded = false;
+async function loadLocations() {
+  if (locationsLoaded) return;
+  const sel = document.getElementById('location-select');
+  try {
+    const data = await (await fetch('/api/locations')).json();
+    if (!data.ok) throw new Error(data.error || 'failed');
+    data.locations.forEach(l => {
+      const o = document.createElement('option');
+      o.value = l.id; o.textContent = l.name; sel.appendChild(o);
+    });
+    locationsLoaded = true;
+  } catch (e) {
+    document.getElementById('location-hint').textContent = 'Could not load locations: ' + e.message;
+  }
+}
+function selectedLocation() {
+  const sel = document.getElementById('location-select');
+  return sel.value ? {id: sel.value, name: sel.options[sel.selectedIndex].textContent} : null;
+}
+function syncOptions() {
+  const mode = document.querySelector('input[name=mode]:checked')?.value;
+  const sel = document.getElementById('location-select');
+  sel.disabled = mode === 'draft';
+  if (mode === 'draft') sel.value = '';
+  const loc = selectedLocation();
+  const expand = document.getElementById('expand-assortments').checked;
+  if (mode === 'order') {
+    document.getElementById('confirm-sub').textContent =
+      `Status: PENDING · Ships from: ${loc ? loc.name : 'default routing'} · Packs ${expand ? 'expanded' : 'kept whole'}`;
+  } else if (mode === 'draft') {
+    document.getElementById('confirm-sub').textContent =
+      `Editable drafts · Packs ${expand ? 'expanded' : 'kept whole'}`;
+  }
+}
+document.getElementById('location-select').addEventListener('change', syncOptions);
+document.getElementById('expand-assortments').addEventListener('change', syncOptions);
 document.getElementById('btn-back-upload').addEventListener('click', resetAll);
 document.getElementById('btn-back-review').addEventListener('click', () => { setStep(2); showPhase('review'); });
 
@@ -551,6 +616,7 @@ function selectMode(val) {
     document.getElementById('confirm-sub').textContent   = 'Orders created immediately · Status: PENDING';
     bs.textContent = 'Submit Live Orders'; bs.className = 'btn btn-primary'; bs.disabled = false;
   }
+  syncOptions();
 }
 document.getElementById('mode-draft-card').addEventListener('click', (e) => { e.preventDefault(); selectMode('draft'); });
 document.getElementById('mode-order-card').addEventListener('click', (e) => { e.preventDefault(); selectMode('order'); });
@@ -558,7 +624,9 @@ document.getElementById('mode-order-card').addEventListener('click', (e) => { e.
 document.getElementById('btn-submit').addEventListener('click', async () => {
   const mode = document.querySelector('input[name=mode]:checked')?.value;
   if (!mode || !currentJobId) return;
-  if (mode==='order' && !confirm(`⚠ Create ${totalOrders} LIVE order(s) in Shopify with status PENDING?\n\nThis cannot be easily undone. Continue?`)) return;
+  const loc = mode === 'order' ? selectedLocation() : null;
+  const expand = document.getElementById('expand-assortments').checked;
+  if (mode==='order' && !confirm(`⚠ Create ${totalOrders} LIVE order(s) in Shopify with status PENDING?\n\nShips from: ${loc ? loc.name : 'Shopify default routing'}\nPDQ/assortment SKUs: ${expand ? 'EXPANDED into components' : 'kept as single SKU'}\n\nThis cannot be easily undone. Continue?`)) return;
   setStep(4); showPhase('processing');
   document.getElementById('log-box').innerHTML = '';
   // Reset cancel button state in case this is a re-run path
@@ -567,7 +635,7 @@ document.getElementById('btn-submit').addEventListener('click', async () => {
   cancelBtn.innerHTML = '✕ &nbsp;Cancel Job';
   document.getElementById('cancel-bar').classList.remove('hidden');
   try {
-    const res  = await fetch('/api/submit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id:currentJobId, mode})});
+    const res  = await fetch('/api/submit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id:currentJobId, mode, location_id: loc ? loc.id : '', expand_assortments: expand})});
     const data = await res.json();
     if (!data.ok) { alert('Error: '+data.error); return; }
     startPolling(currentJobId, totalOrders);
@@ -669,6 +737,9 @@ function resetAll() {
   document.getElementById('mode-draft-card').classList.remove('selected-draft');
   document.getElementById('mode-order-card').classList.remove('selected-order');
   document.getElementById('mode-warning').classList.add('hidden');
+  document.getElementById('location-select').value = '';
+  document.getElementById('location-select').disabled = false;
+  document.getElementById('expand-assortments').checked = true;
   const bs = document.getElementById('btn-submit');
   bs.disabled=true; bs.textContent='Submit'; bs.className='btn btn-primary';
   document.getElementById('btn-download').style.display='none';
