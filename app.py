@@ -18,7 +18,7 @@ load_dotenv(BASE_DIR / ".env")
 
 from shopify_core import init_shopify, validate_excel, load_orders_from_excel, clear_variant_cache
 from draft_processor import process_draft_orders
-from order_processor import process_live_orders
+from order_processor import process_live_orders, list_locations
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", os.urandom(24).hex())
@@ -229,12 +229,14 @@ def api_validate():
     })
 
 
-def _run_job(job_id, mode):
+def _run_job(job_id, mode, location_id=None, expand_assortments=True):
     cancel_event = _get_cancel_event(job_id)
     cancel_event.clear()
 
     job = _load_job(job_id)
     orders = job["orders"]
+    for o in orders:
+        o["_expand_assortments"] = expand_assortments
     _update_job(job_id, status="running", log=[])
 
     def progress(po, status, msg):
@@ -248,7 +250,10 @@ def _run_job(job_id, mode):
         if mode == "draft":
             results = process_draft_orders(orders=orders, progress_callback=progress, cancel_event=cancel_event)
         else:
-            results = process_live_orders(orders=orders, progress_callback=progress, cancel_event=cancel_event)
+            results = process_live_orders(
+                orders=orders, progress_callback=progress, cancel_event=cancel_event,
+                fulfillment_location_id=location_id,
+            )
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode_label = "draft" if mode == "draft" else "order"
@@ -293,12 +298,16 @@ def api_submit():
     data = request.get_json()
     job_id = data.get("job_id")
     mode = data.get("mode")
+    location_id = (data.get("location_id") or "").strip() or None
+    expand_assortments = data.get("expand_assortments", True) is not False
 
     job = _load_job(job_id)
     if job is None:
         return jsonify({"ok": False, "error": "Unknown job"}), 404
     if mode not in ("draft", "order"):
         return jsonify({"ok": False, "error": "mode must be 'draft' or 'order'"}), 400
+    if location_id and mode != "order":
+        return jsonify({"ok": False, "error": "Fulfillment location can only be set for Live Orders"}), 400
     if job["status"] not in ("ready",):
         return jsonify({"ok": False, "error": f"Job is already {job['status']}"}), 409
 
@@ -307,10 +316,20 @@ def api_submit():
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    t = threading.Thread(target=_run_job, args=(job_id, mode), daemon=True)
+    t = threading.Thread(target=_run_job, args=(job_id, mode, location_id, expand_assortments), daemon=True)
     t.start()
 
     return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/api/locations")
+@require_auth
+def api_locations():
+    try:
+        init_shopify()
+        return jsonify({"ok": True, "locations": list_locations()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/status/<job_id>")
