@@ -223,6 +223,7 @@ def api_validate():
             "po_count": len(orders),
             "total_lines": total_lines,
             "companies": companies[:10],
+            "company_count": len(companies),
             "po_list": po_list,
         },
         "preview": preview_rows,
