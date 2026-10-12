@@ -16,7 +16,7 @@ from shopify_core import (
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
-print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_COMPLETE_V5_ZERO_FREIGHT_OK ======")
+print("====== ORDER_PROCESSOR VERSION: POST_CREATE_DRAFT_COMPLETE_V6_LOCATION_OVERRIDE ======")
 print(f"====== DRY_RUN={DRY_RUN} ======")
 
 FREIGHT_RATE_PERCENT = Decimal(os.getenv("FREIGHT_RATE_PERCENT", "12").strip())
@@ -150,8 +150,130 @@ mutation CompleteDraftOrderFree($id: ID!) {
 """
 
 
+LOCATIONS_QUERY = """
+query Locations {
+  locations(first: 100) {
+    nodes { id name isActive fulfillsOnlineOrders }
+  }
+}
+"""
+
+ORDER_FULFILLMENT_ORDERS_QUERY = """
+query OrderFulfillmentOrders($id: ID!) {
+  order(id: $id) {
+    id
+    name
+    fulfillmentOrders(first: 20) {
+      nodes {
+        id
+        status
+        requestStatus
+        assignedLocation { name location { id name } }
+      }
+    }
+  }
+}
+"""
+
+FULFILLMENT_ORDER_MOVE_MUTATION = """
+mutation MoveFulfillmentOrder($id: ID!, $newLocationId: ID!) {
+  fulfillmentOrderMove(id: $id, newLocationId: $newLocationId) {
+    movedFulfillmentOrder { id status assignedLocation { location { id name } } }
+    remainingFulfillmentOrder { id status }
+    userErrors { field message }
+  }
+}
+"""
+
+FULFILLMENT_ORDER_WAIT_SECONDS = int(os.getenv("FULFILLMENT_ORDER_WAIT_SECONDS", "60"))
+FULFILLMENT_ORDER_POLL_SECONDS = 3
+
+
 def _data(out: dict) -> dict:
     return (out.get("data") if isinstance(out, dict) and "data" in out else out) or {}
+
+
+# -------------------- Fulfillment location override --------------------
+def list_locations() -> List[dict]:
+    """Active Shopify locations, for the uploader's location picker."""
+    out = shopify_graphql(LOCATIONS_QUERY)
+    if isinstance(out, dict) and out.get("errors"):
+        raise RuntimeError(f"locations query errors: {out['errors']}")
+    nodes = (_data(out).get("locations") or {}).get("nodes") or []
+    return sorted(
+        [{"id": n["id"], "name": n.get("name") or ""} for n in nodes if n.get("isActive")],
+        key=lambda n: n["name"],
+    )
+
+
+def _resolve_location(location_id: str) -> dict:
+    matches = [loc for loc in list_locations() if loc["id"] == location_id]
+    if not matches:
+        raise RuntimeError(f"Fulfillment location {location_id} not found or inactive")
+    return matches[0]
+
+
+def _fetch_fulfillment_orders(order_id: str) -> Tuple[str, List[dict]]:
+    out = shopify_graphql(ORDER_FULFILLMENT_ORDERS_QUERY, {"id": order_id})
+    if isinstance(out, dict) and out.get("errors"):
+        raise RuntimeError(f"fulfillmentOrders query errors: {out['errors']}")
+    order = _data(out).get("order") or {}
+    return order.get("name") or order_id, ((order.get("fulfillmentOrders") or {}).get("nodes") or [])
+
+
+def _fo_location_id(fo: dict) -> str:
+    return (((fo.get("assignedLocation") or {}).get("location") or {}).get("id")) or ""
+
+
+def _fo_location_name(fo: dict) -> str:
+    assigned = fo.get("assignedLocation") or {}
+    return ((assigned.get("location") or {}).get("name")) or assigned.get("name") or "?"
+
+
+def move_order_to_location(order_id: str, location: dict) -> str:
+    """
+    Move every open fulfillment order on a freshly created order to `location`,
+    then re-read and prove nothing open is left anywhere else.
+    Same pattern as ll_00_0026-order-release.py (fulfillmentOrderMove right after completion).
+    """
+    deadline = time.time() + FULFILLMENT_ORDER_WAIT_SECONDS
+    while True:
+        order_name, fos = _fetch_fulfillment_orders(order_id)
+        if fos or time.time() >= deadline:
+            break
+        time.sleep(FULFILLMENT_ORDER_POLL_SECONDS)
+
+    if not fos:
+        raise RuntimeError(f"{order_name}: no fulfillment orders appeared within {FULFILLMENT_ORDER_WAIT_SECONDS}s")
+
+    for fo in fos:
+        status = (fo.get("status") or "").upper()
+        if _fo_location_id(fo) == location["id"] or status in ("CLOSED", "CANCELLED"):
+            continue
+        if status not in ("OPEN", "SCHEDULED", "ON_HOLD"):
+            raise RuntimeError(f"{order_name}: fulfillment order {fo['id']} is {status}; not movable")
+        if (fo.get("requestStatus") or "UNSUBMITTED").upper() != "UNSUBMITTED":
+            raise RuntimeError(f"{order_name}: fulfillment order {fo['id']} already submitted to fulfillment service")
+
+        out = shopify_graphql(FULFILLMENT_ORDER_MOVE_MUTATION, {"id": fo["id"], "newLocationId": location["id"]})
+        if isinstance(out, dict) and out.get("errors"):
+            raise RuntimeError(f"fulfillmentOrderMove errors: {out['errors']}")
+        errs = (_data(out).get("fulfillmentOrderMove") or {}).get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"fulfillmentOrderMove {_fo_location_name(fo)} -> {location['name']}: {errs}")
+
+    order_name, fos = _fetch_fulfillment_orders(order_id)
+    stragglers = [
+        f"{_fo_location_name(fo)} ({fo.get('status')})"
+        for fo in fos
+        if _fo_location_id(fo) != location["id"]
+        and (fo.get("status") or "").upper() not in ("CLOSED", "CANCELLED")
+    ]
+    if stragglers:
+        # Typically means the location doesn't stock part of the order, so Shopify split it.
+        raise RuntimeError(f"{order_name}: still has open fulfillment at {', '.join(stragglers)} after move")
+
+    return f"fulfillment moved to {location['name']}"
 
 
 def _shop_currency() -> str:
@@ -1107,7 +1229,7 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
         if qty <= 0:
             continue
 
-        if is_assortment_parent(sku):
+        if order.get("_expand_assortments", True) and is_assortment_parent(sku):
             for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
                 child_qty = int(child_qty)
                 variant_id, shop_price = find_variant_id_and_price(child_sku)
@@ -1280,9 +1402,15 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     return order_id, f"COMPLETED_FROM_DRAFT {order_name or ''} | {post_update_summary}".strip()
 
 
-def process_live_orders(orders, progress_callback=None, cancel_event=None):
+def process_live_orders(orders, progress_callback=None, cancel_event=None, fulfillment_location_id=None):
     results = []
     seen_pos = set()
+
+    # Optional: force every created order to ship from one location (e.g. CA03).
+    # Resolved once up front so a bad ID fails the job before anything is created.
+    target_location = _resolve_location(fulfillment_location_id) if fulfillment_location_id else None
+    if target_location and progress_callback:
+        progress_callback("—", "processing", f"Fulfillment location override: {target_location['name']}")
 
     for order in orders:
         if cancel_event and cancel_event.is_set():
@@ -1349,6 +1477,23 @@ def process_live_orders(orders, progress_callback=None, cancel_event=None):
 
             created_label = "Draft created" if DRY_RUN else "Order created"
 
+            if target_location and not DRY_RUN:
+                try:
+                    move_note = move_order_to_location(order_id, target_location)
+                    dfs = f"{dfs or 'PENDING'} | {move_note}"
+                except Exception as move_exc:
+                    # Order exists in Shopify - report it loudly so it gets moved by hand.
+                    reason = f"Order created ({order_id}) but NOT moved to {target_location['name']}: {move_exc}"
+                    results.append({
+                        "po": po_number, "status": "error", "reason": reason, "id": order_id,
+                        "company": billToName, "line_count": len(order.get("details", [])),
+                    })
+                    if progress_callback:
+                        progress_callback(po_number, "error", reason)
+                    seen_pos.add(po_norm)
+                    time.sleep(0.15)
+                    continue
+
             results.append({
                 "po": po_number,
                 "status": "created",
@@ -1360,7 +1505,8 @@ def process_live_orders(orders, progress_callback=None, cancel_event=None):
             })
 
             if progress_callback:
-                progress_callback(po_number, "created", f"{created_label}: {order_id}")
+                where = f" → {target_location['name']}" if target_location and not DRY_RUN else ""
+                progress_callback(po_number, "created", f"{created_label}: {order_id}{where}")
 
         except Exception as e:
             results.append({"po": po_number, "status": "error", "reason": str(e), "id": None})
