@@ -545,7 +545,7 @@ function renderReview(data) {
   const s = data.summary;
   document.getElementById('stat-pos').textContent = s.po_count;
   document.getElementById('stat-lines').textContent = s.total_lines;
-  document.getElementById('stat-companies').textContent = s.companies.length;
+  document.getElementById('stat-companies').textContent = s.company_count ?? s.companies.length;
   const wDiv = document.getElementById('review-warnings'); wDiv.innerHTML = '';
   if (data.warnings?.length)
     wDiv.innerHTML = `<div class="alert alert-warn">⚠ <div><strong>Warnings:</strong><ul>${data.warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul></div></div>`;
