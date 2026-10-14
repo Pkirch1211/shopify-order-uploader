@@ -1229,7 +1229,7 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
         if qty <= 0:
             continue
 
-        if order.get("_expand_assortments", True) and is_assortment_parent(sku):
+        if is_assortment_parent(sku):
             for child_sku, child_qty, fallback_price in expand_assortment_children(sku, qty):
                 child_qty = int(child_qty)
                 variant_id, shop_price = find_variant_id_and_price(child_sku)
