@@ -855,7 +855,10 @@ def _ensure_draft_shipping_logic(draft: dict) -> Tuple[bool, str, str, str, str]
     if not freight_title:
         freight_title = DEFAULT_FREIGHT_TITLE
 
-    if _shipping_line_matches(draft, freight_title, freight_price):
+    has_line = bool((draft.get("shippingLine") or {}).get("title"))
+    if _shipping_line_matches(draft, freight_title, freight_price) and (
+        freight_action != "free-freight" or has_line
+    ):
         return True, freight_action, freight_title, freight_price, (
             f"Existing shipping already matches {freight_title} at {freight_price}"
         )
@@ -1211,6 +1214,78 @@ def _try_draft_order_create(
     return draft_id, draft_name, [], out
 
 
+ORDER_SHIPPING_LINES_QUERY = """
+query OrderShippingLines($id: ID!) {
+  order(id: $id) {
+    name
+    shippingLines(first: 5) { nodes { title } }
+  }
+}
+"""
+
+ORDER_EDIT_BEGIN_MUTATION = """
+mutation OrderEditBegin($id: ID!) {
+  orderEditBegin(id: $id) {
+    calculatedOrder { id }
+    userErrors { field message }
+  }
+}
+"""
+
+ORDER_EDIT_ADD_SHIPPING_LINE_MUTATION = """
+mutation OrderEditAddShippingLine($id: ID!, $shippingLine: OrderEditAddShippingLineInput!) {
+  orderEditAddShippingLine(id: $id, shippingLine: $shippingLine) {
+    calculatedShippingLine { title }
+    userErrors { field message }
+  }
+}
+"""
+
+ORDER_EDIT_COMMIT_MUTATION = """
+mutation OrderEditCommit($id: ID!) {
+  orderEditCommit(id: $id, notifyCustomer: false, staffNote: "Added free-freight shipping line") {
+    order { id }
+    userErrors { field message }
+  }
+}
+"""
+
+
+def _gql_checked(query: str, variables: dict, key: str) -> dict:
+    out = shopify_graphql(query, variables)
+    if isinstance(out, dict) and out.get("errors"):
+        raise RuntimeError(f"{key} errors: {out['errors']}")
+    payload = _data(out).get(key) or {}
+    errs = payload.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"{key} userErrors: {errs}")
+    return payload
+
+
+def _ensure_order_shipping_line(order_id: str, title: str) -> str:
+    """If the order has no shipping line, add `title` at $0.00 via an order edit."""
+    out = shopify_graphql(ORDER_SHIPPING_LINES_QUERY, {"id": order_id})
+    order = _data(out).get("order") or {}
+    existing = [n.get("title") for n in ((order.get("shippingLines") or {}).get("nodes") or []) if n.get("title")]
+    if existing:
+        return f"shipping line: {existing[0]}"
+
+    calc = _gql_checked(ORDER_EDIT_BEGIN_MUTATION, {"id": order_id}, "orderEditBegin")
+    calc_id = (calc.get("calculatedOrder") or {}).get("id")
+    if not calc_id:
+        raise RuntimeError("orderEditBegin returned no calculated order")
+    _gql_checked(
+        ORDER_EDIT_ADD_SHIPPING_LINE_MUTATION,
+        {"id": calc_id, "shippingLine": {
+            "title": title,
+            "price": {"amount": "0.00", "currencyCode": _shop_currency()},
+        }},
+        "orderEditAddShippingLine",
+    )
+    _gql_checked(ORDER_EDIT_COMMIT_MUTATION, {"id": calc_id}, "orderEditCommit")
+    return f"shipping line: {title} $0.00 (added after completion)"
+
+
 def create_live_order(order, customer_id, company_id, company_contact_id, company_location_id):
     note_parts = []
 
@@ -1403,7 +1478,16 @@ def create_live_order(order, customer_id, company_id, company_contact_id, compan
     order_id = completed_order.get("id")
     order_name = completed_order.get("name")
 
-    return order_id, f"COMPLETED_FROM_DRAFT {order_name or ''} | {post_update_summary}".strip()
+    # Free freight still needs a carrier on the order (default UPS Ground at $0).
+    # Shopify can drop a $0 custom shipping line during draft completion, so check and add it back.
+    ship_title = _detect_freight_title(_build_draft_style_note_blob(latest)) or DEFAULT_FREIGHT_TITLE
+    try:
+        ship_note = _ensure_order_shipping_line(order_id, ship_title)
+    except Exception as ship_exc:
+        ship_note = f"WARNING shipping line not set ({ship_title} $0): {ship_exc}"
+        print(f"{order_name} | {ship_note}")
+
+    return order_id, f"COMPLETED_FROM_DRAFT {order_name or ''} | {post_update_summary} | {ship_note}".strip()
 
 
 def process_live_orders(orders, progress_callback=None, cancel_event=None, fulfillment_location_id=None):
