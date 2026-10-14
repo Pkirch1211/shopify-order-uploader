@@ -230,14 +230,12 @@ def api_validate():
     })
 
 
-def _run_job(job_id, mode, location_id=None, expand_assortments=True):
+def _run_job(job_id, mode, location_id=None):
     cancel_event = _get_cancel_event(job_id)
     cancel_event.clear()
 
     job = _load_job(job_id)
     orders = job["orders"]
-    for o in orders:
-        o["_expand_assortments"] = expand_assortments
     _update_job(job_id, status="running", log=[])
 
     def progress(po, status, msg):
@@ -300,7 +298,6 @@ def api_submit():
     job_id = data.get("job_id")
     mode = data.get("mode")
     location_id = (data.get("location_id") or "").strip() or None
-    expand_assortments = data.get("expand_assortments", True) is not False
 
     job = _load_job(job_id)
     if job is None:
@@ -317,7 +314,7 @@ def api_submit():
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    t = threading.Thread(target=_run_job, args=(job_id, mode, location_id, expand_assortments), daemon=True)
+    t = threading.Thread(target=_run_job, args=(job_id, mode, location_id), daemon=True)
     t.start()
 
     return jsonify({"ok": True, "job_id": job_id})
