@@ -17,7 +17,9 @@ LOG_TIMINGS = False
 REST_PAGE_LIMIT = 250
 MAX_PAGES_PER_STATUS = 100
 REST_PAGE_SLEEP = 0.03
-REST_DEDUPE_ENABLED = True
+# Full REST scan of every order/draft when the GraphQL PO search finds nothing.
+# Slow on a large store (minutes per PO). Set REST_DEDUPE_ENABLED=false in Railway to skip it.
+REST_DEDUPE_ENABLED = os.getenv("REST_DEDUPE_ENABLED", "true").strip().lower() == "true"
 
 
 def _get_shopify_token():
@@ -254,12 +256,7 @@ ASSORTMENT_MAP: dict[str, list[tuple[str, int, float]]] = {
         ("LL-20-3232", 6, 3.50),
         ("LL-99-0014", 1, 0.00),
     ],
-    "LL-00-0015": [
-        ("LL-20-3250", 18, 3.50),
-        ("LL-20-3251", 9, 3.50),
-        ("LL-20-3255", 9, 3.50),
-        ("LL-99-0015", 1, 0.00),
-    ],
+    # LL-00-0015 (Holiday Mini PDQ) intentionally NOT expanded - uploads as a single SKU.
     "LL-DISP-FA-SP26": [
         ("LL-16-3149", 8, 6.50),
         ("LL-16-3151", 4, 6.50),
