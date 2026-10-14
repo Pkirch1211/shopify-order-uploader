@@ -244,7 +244,11 @@ def move_order_to_location(order_id: str, location: dict) -> str:
         time.sleep(FULFILLMENT_ORDER_POLL_SECONDS)
 
     if not fos:
-        raise RuntimeError(f"{order_name}: no fulfillment orders appeared within {FULFILLMENT_ORDER_WAIT_SECONDS}s")
+        raise RuntimeError(
+            f"{order_name}: no fulfillment orders visible after {FULFILLMENT_ORDER_WAIT_SECONDS}s - "
+            "check the app has read/write_merchant_managed_fulfillment_orders scopes "
+            "and the SKU is set as a physical (shippable) product"
+        )
 
     for fo in fos:
         status = (fo.get("status") or "").upper()
